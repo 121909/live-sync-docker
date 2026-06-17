@@ -59,6 +59,13 @@ ADDED_TIME_RE = re.compile(r"(?<!\d)\+([0-9]{1,2})(?:[:：.]([0-9]{2})(?!\d)|(?!
 ADDED_LINE_RE = re.compile(r"^\+?([0-9]{1,2})(?:[:：.]([0-9]{2}))?$")
 ELAPSED_ADDED_TIME_RE = re.compile(r"(?<![+\d])([0-9]{1,2})[:：.]([0-5][0-9])(?:\+[0-9]{1,2})?(?!\d)")
 ADJACENT_STOPPAGE_BASES = {45, 90, 105, 120}
+DEFAULT_VIDEO_TIMER_ROI_PRESETS = "\n".join([
+    "0.132,0.055,0.078,0.140",
+    "0.333,0.058,0.080,0.140",
+    "0.114,0.049,0.077,0.077",
+    "0.111,0.000,0.077,0.185",
+])
+DEFAULT_AUDIO_TIMER_ROI_PRESETS = "0.824,0.080,0.078,0.140"
 
 
 def env(name, default=""):
@@ -215,8 +222,8 @@ def make_default_profile():
         "snapshot_interval": int(env("SNAPSHOT_INTERVAL", "60") or 60),
         "video_roi": env("VIDEO_TIMER_ROI", "0.050,0.050,0.070,0.050"),
         "audio_roi": env("AUDIO_TIMER_ROI", "0.885,0.085,0.075,0.060"),
-        "video_roi_presets": env("VIDEO_TIMER_ROI_PRESETS", ""),
-        "audio_roi_presets": env("AUDIO_TIMER_ROI_PRESETS", ""),
+        "video_roi_presets": env("VIDEO_TIMER_ROI_PRESETS", "").strip() or DEFAULT_VIDEO_TIMER_ROI_PRESETS,
+        "audio_roi_presets": env("AUDIO_TIMER_ROI_PRESETS", "").strip() or DEFAULT_AUDIO_TIMER_ROI_PRESETS,
         "schedule_enabled": env_bool("SCHEDULE_ENABLED", True),
         "schedule_provider": env("SCHEDULE_PROVIDER", "espn"),
         "schedule_league": env("SCHEDULE_LEAGUE", "fifa.world"),
@@ -838,8 +845,8 @@ class LiveManager:
         merged["snapshot_interval"] = coerce_int(merged.get("snapshot_interval"), DEFAULT_PROFILE["snapshot_interval"], minimum=10)
         merged["video_roi"] = coerce_text(merged.get("video_roi"), DEFAULT_PROFILE["video_roi"])
         merged["audio_roi"] = coerce_text(merged.get("audio_roi"), DEFAULT_PROFILE["audio_roi"])
-        merged["video_roi_presets"] = str(merged.get("video_roi_presets", "") or "")
-        merged["audio_roi_presets"] = str(merged.get("audio_roi_presets", "") or "")
+        merged["video_roi_presets"] = coerce_text(merged.get("video_roi_presets"), DEFAULT_PROFILE["video_roi_presets"])
+        merged["audio_roi_presets"] = coerce_text(merged.get("audio_roi_presets"), DEFAULT_PROFILE["audio_roi_presets"])
         merged["schedule_enabled"] = parse_bool(merged.get("schedule_enabled", DEFAULT_PROFILE["schedule_enabled"]))
         merged["schedule_provider"] = coerce_text(merged.get("schedule_provider"), DEFAULT_PROFILE["schedule_provider"])
         merged["schedule_league"] = coerce_text(merged.get("schedule_league"), DEFAULT_PROFILE["schedule_league"])
