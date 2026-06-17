@@ -1,12 +1,12 @@
-# Live Sync Control Plane
+# 直播同步控制后端
 
-Run locally:
+本地运行：
 
 ```bash
 LIVE_SYNC_STATE_DIR=/state LIVE_SYNC_HLS_DIR=/hls uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Profile example:
+配置示例：
 
 ```json
 {
@@ -28,15 +28,15 @@ Profile example:
 }
 ```
 
-Endpoints:
+接口：
 
-- `POST /m3u/search` with `{ "playlist_url": "...", "query": "cctv", "limit": 50 }`
-- `POST /m3u/resolve` with `{ "playlist_url": "...", "query": "cctv5" }`
+- `POST /m3u/search`，请求体为 `{ "playlist_url": "...", "query": "cctv", "limit": 50 }`
+- `POST /m3u/resolve`，请求体为 `{ "playlist_url": "...", "query": "cctv5" }`
 - `GET /profiles`, `GET /profiles/{id}`, `PUT /profiles/{id}`, `DELETE /profiles/{id}`
-- `POST /stream/start` with `{ "profile_id": "default" }`
+- `POST /stream/start`，请求体为 `{ "profile_id": "default" }`
 - `POST /stream/stop`, `GET /stream/status`, `GET /logs`
 - `POST /snapshot`, `GET /snapshot/latest`
 - `GET/PUT /config/{id}/offset`
 - `GET/PUT /config/{id}/roi`
 
-The backend stores JSON state in `LIVE_SYNC_STATE_DIR` or `/state` by default. It writes HLS output to `LIVE_SYNC_HLS_DIR` or `/hls` by default.
+后端默认把 JSON 状态写入 `LIVE_SYNC_STATE_DIR`，未设置时使用 `/state`。HLS 输出默认写入 `LIVE_SYNC_HLS_DIR`，未设置时使用 `/hls`。

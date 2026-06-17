@@ -15,21 +15,6 @@
 - WebUI 中填写的源 URL、本地 M3U 内容和请求头会保存到服务器 `state/profile.json`，容器重启、`AUTO_START` 和赛程自动启动才能自动运行。
 - 输出 `index.m3u8` 和 Emby 可用的 `emby.m3u`。
 
-
-## 免 Docker 便携版
-
-可以打包成 Windows/Linux 便携版，给不会使用 Docker 的用户直接运行。
-
-Windows 用户拿到打包后的 `LiveSync` 文件夹后，双击 `启动.bat` 即可。Linux 用户运行 `./启动.sh`。程序会自动打开 WebUI：
-
-```text
-http://127.0.0.1:18080/
-```
-
-打包说明见：`README.desktop.zh-CN.md`。
-
-便携版不需要 Docker，但仍需要 `ffmpeg` 和 `tesseract`。打包时可以把它们放到软件目录的 `bin/` 文件夹里。
-
 ## 运行方式
 
 构建并启动：
@@ -77,27 +62,6 @@ docker logs -f live-sync-cctv
 7. 点击“保存”，再点击“启动”。
 8. 用“工具 / 截图”里的同步截图检查计时器位置。程序运行中截图来自当前播放链路（包含 offset 延迟后的输入），不是原始未延迟源。
 9. 复制 HLS 地址，或在 Emby 中使用 `emby.m3u`。
-
-如果只有零散直链，可以写成本地 M3U 后粘贴，例如：
-
-```m3u
-#EXTM3U
-#EXTINF:-1 group-title="本地",BBC Stream 41 UHD
-https://ve-uhd-push-uk.live.fastly.md.bbci.co.uk/x=4/i=urn:bbc:pips:service:uk_bbc_stream_041/iptv_uhd_v1.mpd
-```
-
-多个 M3U 会按填写顺序解析。预览频道时会合并显示所有列表；启动时如果前面的列表找不到指定频道，会继续尝试后面的列表。
-
-如果某个源在 Emby 能播，但本程序日志里出现 403，可以在“视频请求头”或“音频请求头”里补请求头，每行一个：
-
-```text
-Referer: https://example.com/
-Origin: https://example.com
-User-Agent: Mozilla/5.0 ...
-Cookie: key=value
-```
-
-M3U 中常见的 `|User-Agent=...&Referer=...`、`#EXTVLCOPT:http-referrer=...`、`#KODIPROP:...stream_headers=...` 会自动解析并传给 ffmpeg。
 
 ## 常用参数
 
@@ -268,7 +232,7 @@ FFMPEG_USER_AGENT="你的 User-Agent" docker compose up -d --build
 如果要设置全局默认请求头，可以设置：
 
 ```bash
-DEFAULT_REQUEST_HEADERS=$'User-Agent: Emby\nAccept: */*\nCache-Control: no-cache\nPragma: no-cache\nReferer: https://example.com/' docker compose up -d --build
+DEFAULT_REQUEST_HEADERS=$'User-Agent: Emby\nAccept: */*\nCache-Control: no-cache\nPragma: no-cache' docker compose up -d --build
 ```
 
 播放器请求 `/index.m3u8` 时如果短暂返回 503，通常表示管线正在重启或还没生成新播放列表；这不是播放器访问被拒绝。
