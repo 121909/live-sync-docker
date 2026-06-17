@@ -187,6 +187,7 @@ def make_default_profile():
         "AUTO_ALIGN_OUTSIDE_MATCH",
         not env_bool("ALIGN_ONLY_DURING_MATCH", True),
     )
+    auto_align_interval = int(env("AUTO_ALIGN_INTERVAL", env("SNAPSHOT_INTERVAL", "60")) or 60)
     return {
         "name": env("PROFILE_NAME", "4K + Chinese commentary"),
         "video_url": "",
@@ -214,14 +215,14 @@ def make_default_profile():
         "channel_number": env("CHANNEL_NUMBER", "5"),
         "channel_group": env("CHANNEL_GROUP", "Sports"),
         "auto_align_enabled": env_bool("AUTO_ALIGN_ENABLED", True),
-        "auto_align_interval": int(env("AUTO_ALIGN_INTERVAL", "60") or 60),
+        "auto_align_interval": auto_align_interval,
         "auto_align_samples": int(env("AUTO_ALIGN_SAMPLES", "3") or 3),
         "auto_align_step": float(env("AUTO_ALIGN_STEP", "1") or 1),
         "auto_align_threshold": float(env("AUTO_ALIGN_THRESHOLD", "1") or 1),
         "auto_align_max_offset": float(env("AUTO_ALIGN_MAX_OFFSET", "180") or 180),
         "auto_align_relocate_attempts": int(env("AUTO_ALIGN_RELOCATE_ATTEMPTS", "3") or 3),
         "auto_align_stop_after_aligned": env_bool("AUTO_ALIGN_STOP_AFTER_ALIGNED", False),
-        "snapshot_interval": int(env("SNAPSHOT_INTERVAL", "60") or 60),
+        "snapshot_interval": auto_align_interval,
         "video_roi": env("VIDEO_TIMER_ROI", "0.050,0.050,0.070,0.050"),
         "audio_roi": env("AUDIO_TIMER_ROI", "0.885,0.085,0.075,0.060"),
         "video_roi_presets": env("VIDEO_TIMER_ROI_PRESETS", "").strip() or DEFAULT_VIDEO_TIMER_ROI_PRESETS,
@@ -393,7 +394,6 @@ RUNTIME_AUTO_ALIGN_KEYS = {
     "auto_align_max_offset",
     "auto_align_relocate_attempts",
     "auto_align_stop_after_aligned",
-    "snapshot_interval",
     "video_roi",
     "audio_roi",
     "video_roi_presets",
@@ -864,14 +864,15 @@ class LiveManager:
         merged["local_cache_enabled"] = parse_bool(merged.get("local_cache_enabled", DEFAULT_PROFILE["local_cache_enabled"]))
         merged["local_cache_seconds"] = coerce_int(merged.get("local_cache_seconds"), DEFAULT_PROFILE["local_cache_seconds"], minimum=30)
         merged["auto_align_enabled"] = parse_bool(merged.get("auto_align_enabled", DEFAULT_PROFILE["auto_align_enabled"]))
-        merged["auto_align_interval"] = coerce_int(merged.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"], minimum=5)
+        interval_value = raw_profile.get("auto_align_interval", raw_profile.get("snapshot_interval", merged.get("auto_align_interval")))
+        merged["auto_align_interval"] = coerce_int(interval_value, DEFAULT_PROFILE["auto_align_interval"], minimum=5)
         merged["auto_align_samples"] = coerce_int(merged.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=3)
         merged["auto_align_step"] = coerce_float(merged.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"], minimum=0.5)
         merged["auto_align_threshold"] = coerce_float(merged.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
         merged["auto_align_max_offset"] = coerce_float(merged.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"], minimum=1)
         merged["auto_align_relocate_attempts"] = coerce_int(merged.get("auto_align_relocate_attempts"), DEFAULT_PROFILE["auto_align_relocate_attempts"], minimum=0)
         merged["auto_align_stop_after_aligned"] = parse_bool(merged.get("auto_align_stop_after_aligned", DEFAULT_PROFILE["auto_align_stop_after_aligned"]))
-        merged["snapshot_interval"] = coerce_int(merged.get("snapshot_interval"), DEFAULT_PROFILE["snapshot_interval"], minimum=10)
+        merged["snapshot_interval"] = merged["auto_align_interval"]
         merged["video_roi"] = coerce_text(merged.get("video_roi"), DEFAULT_PROFILE["video_roi"])
         merged["audio_roi"] = coerce_text(merged.get("audio_roi"), DEFAULT_PROFILE["audio_roi"])
         merged["video_roi_presets"] = coerce_text(merged.get("video_roi_presets"), DEFAULT_PROFILE["video_roi_presets"])
@@ -934,7 +935,7 @@ class LiveManager:
                 "max_offset": coerce_float(aa.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"]),
                 "relocate_attempts": coerce_int(aa.get("auto_align_relocate_attempts"), DEFAULT_PROFILE["auto_align_relocate_attempts"], minimum=0),
                 "stop_after_aligned": parse_bool(aa.get("auto_align_stop_after_aligned", DEFAULT_PROFILE["auto_align_stop_after_aligned"])),
-                "snapshot_interval": coerce_int(aa.get("snapshot_interval"), DEFAULT_PROFILE["snapshot_interval"]),
+                "snapshot_interval": coerce_int(aa.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"]),
                 "video_roi": coerce_text(aa.get("video_roi"), DEFAULT_PROFILE["video_roi"]),
                 "audio_roi": coerce_text(aa.get("audio_roi"), DEFAULT_PROFILE["audio_roi"]),
                 "video_roi_presets": aa.get("video_roi_presets", ""),
@@ -1745,6 +1746,107 @@ class LiveManager:
             return None
         return median
 
+    def _monitor_alignment_from_frames(self, video_frame, audio_frame, profile, monitor):
+        threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
+        required_mismatches = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=1)
+        current = float(profile.get("offset_seconds", 0) or 0)
+
+        monitor.checks += 1
+        if not monitor.video_roi:
+            sample, source = self._find_clock_with_presets(video_frame, profile, "video")
+            if sample:
+                self._lock_monitor_roi(monitor, "video", sample, profile, source)
+        if not monitor.audio_roi:
+            sample, source = self._find_clock_with_presets(audio_frame, profile, "audio")
+            if sample:
+                self._lock_monitor_roi(monitor, "audio", sample, profile, source)
+
+        if not monitor.locked():
+            monitor.state = "acquiring"
+            missing = []
+            if not monitor.video_roi:
+                missing.append("video")
+            if not monitor.audio_roi:
+                missing.append("audio")
+            monitor.message = "waiting for timer ROI: " + ",".join(missing)
+            return None, monitor.message
+
+        video_sample = self._read_locked_clock(video_frame, monitor.video_roi)
+        audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi)
+        if video_sample and not monitor.video_roi_locked:
+            monitor.video_roi_locked = True
+            monitor.video_clock = video_sample.text
+            self.log(f"auto-align: locked video ROI from configured {self._format_roi_value(video_sample.roi)} ({video_sample.text})")
+        if audio_sample and not monitor.audio_roi_locked:
+            monitor.audio_roi_locked = True
+            monitor.audio_clock = audio_sample.text
+            self.log(f"auto-align: locked audio ROI from configured {self._format_roi_value(audio_sample.roi)} ({audio_sample.text})")
+        if not video_sample and not monitor.video_roi_locked:
+            monitor.video_roi = None
+        if not audio_sample and not monitor.audio_roi_locked:
+            monitor.audio_roi = None
+        if not monitor.video_roi:
+            sample, source = self._find_clock_with_presets(video_frame, profile, "video")
+            if sample:
+                video_sample = sample
+                self._lock_monitor_roi(monitor, "video", sample, profile, source)
+        if not monitor.audio_roi:
+            sample, source = self._find_clock_with_presets(audio_frame, profile, "audio")
+            if sample:
+                audio_sample = sample
+                self._lock_monitor_roi(monitor, "audio", sample, profile, source)
+        if not monitor.locked():
+            monitor.state = "acquiring"
+            monitor.message = "configured ROI unreadable; searching timer ROI"
+            return None, monitor.message
+        if not video_sample or not audio_sample:
+            monitor.state = "locked"
+            monitor.message = (
+                "timer missing in locked ROI; pausing alignment check "
+                f"({monitor.mismatch_count}/{required_mismatches})"
+            )
+            return None, monitor.message
+
+        monitor.video_clock = video_sample.text
+        monitor.audio_clock = audio_sample.text
+        candidate, detail = self._candidate_offset_from_samples(video_sample, audio_sample, profile)
+        if candidate is None:
+            monitor.state = "locked"
+            monitor.message = (
+                detail + "; pausing alignment check "
+                f"({monitor.mismatch_count}/{required_mismatches})"
+            )
+            return None, monitor.message
+
+        delta = abs(candidate - current)
+        if video_sample.game_time == audio_sample.game_time and delta >= threshold:
+            monitor.state = "realigning"
+            monitor.message = f"matched clocks; new offset {candidate:.3f}s {detail}"
+            self.log(f"auto-align: {monitor.message}")
+            return candidate, monitor.message
+
+        if delta < threshold:
+            monitor.state = "aligned"
+            monitor.message = f"stable current={current:.3f}s candidate={candidate:.3f}s {detail}"
+            monitor.mismatch_offsets.clear()
+            monitor.mismatch_count = 0
+            return None, monitor.message
+
+        monitor.mismatch_offsets.append(candidate)
+        monitor.mismatch_offsets = monitor.mismatch_offsets[-required_mismatches:]
+        monitor.mismatch_count = len(monitor.mismatch_offsets)
+        stable = self._stable_mismatch_offset(monitor.mismatch_offsets)
+        if monitor.mismatch_count >= required_mismatches and stable is not None:
+            monitor.state = "realigning"
+            monitor.message = f"{monitor.mismatch_count} mismatches; new offset {stable:.3f}s {detail}"
+            self.log(f"auto-align: {monitor.message}")
+            return stable, monitor.message
+
+        monitor.state = "mismatch"
+        monitor.message = f"mismatch {monitor.mismatch_count}/{required_mismatches}: current={current:.3f}s candidate={candidate:.3f}s {detail}"
+        self.log(f"auto-align: {monitor.message}")
+        return None, monitor.message
+
     def _monitor_alignment_once(self, video, audio, profile, monitor):
         if not audio or not audio.url:
             monitor.state = "disabled"
@@ -1752,10 +1854,6 @@ class LiveManager:
             return None, monitor.message
 
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-        threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
-        required_mismatches = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=1)
-        current = float(profile.get("offset_seconds", 0) or 0)
-
         with tempfile.TemporaryDirectory(prefix="align_frame_") as tmp:
             tmpdir = Path(tmp)
             try:
@@ -1765,102 +1863,7 @@ class LiveManager:
                 monitor.message = f"frame capture failed: {exc}"
                 self.log(f"auto-align: {monitor.message}; keeping current offset")
                 return None, monitor.message
-
-            monitor.checks += 1
-            if not monitor.video_roi:
-                sample, source = self._find_clock_with_presets(video_frame, profile, "video")
-                if sample:
-                    self._lock_monitor_roi(monitor, "video", sample, profile, source)
-            if not monitor.audio_roi:
-                sample, source = self._find_clock_with_presets(audio_frame, profile, "audio")
-                if sample:
-                    self._lock_monitor_roi(monitor, "audio", sample, profile, source)
-
-            if not monitor.locked():
-                monitor.state = "acquiring"
-                missing = []
-                if not monitor.video_roi:
-                    missing.append("video")
-                if not monitor.audio_roi:
-                    missing.append("audio")
-                monitor.message = "waiting for timer ROI: " + ",".join(missing)
-                return None, monitor.message
-
-            video_sample = self._read_locked_clock(video_frame, monitor.video_roi)
-            audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi)
-            if video_sample and not monitor.video_roi_locked:
-                monitor.video_roi_locked = True
-                monitor.video_clock = video_sample.text
-                self.log(f"auto-align: locked video ROI from configured {self._format_roi_value(video_sample.roi)} ({video_sample.text})")
-            if audio_sample and not monitor.audio_roi_locked:
-                monitor.audio_roi_locked = True
-                monitor.audio_clock = audio_sample.text
-                self.log(f"auto-align: locked audio ROI from configured {self._format_roi_value(audio_sample.roi)} ({audio_sample.text})")
-            if not video_sample and not monitor.video_roi_locked:
-                monitor.video_roi = None
-            if not audio_sample and not monitor.audio_roi_locked:
-                monitor.audio_roi = None
-            if not monitor.video_roi:
-                sample, source = self._find_clock_with_presets(video_frame, profile, "video")
-                if sample:
-                    video_sample = sample
-                    self._lock_monitor_roi(monitor, "video", sample, profile, source)
-            if not monitor.audio_roi:
-                sample, source = self._find_clock_with_presets(audio_frame, profile, "audio")
-                if sample:
-                    audio_sample = sample
-                    self._lock_monitor_roi(monitor, "audio", sample, profile, source)
-            if not monitor.locked():
-                monitor.state = "acquiring"
-                monitor.message = "configured ROI unreadable; searching timer ROI"
-                return None, monitor.message
-            if not video_sample or not audio_sample:
-                monitor.state = "locked"
-                monitor.message = (
-                    "timer missing in locked ROI; pausing alignment check "
-                    f"({monitor.mismatch_count}/{required_mismatches})"
-                )
-                return None, monitor.message
-
-            monitor.video_clock = video_sample.text
-            monitor.audio_clock = audio_sample.text
-            candidate, detail = self._candidate_offset_from_samples(video_sample, audio_sample, profile)
-            if candidate is None:
-                monitor.state = "locked"
-                monitor.message = (
-                    detail + "; pausing alignment check "
-                    f"({monitor.mismatch_count}/{required_mismatches})"
-                )
-                return None, monitor.message
-
-            delta = abs(candidate - current)
-            if video_sample.game_time == audio_sample.game_time and delta >= threshold:
-                monitor.state = "realigning"
-                monitor.message = f"matched clocks; new offset {candidate:.3f}s {detail}"
-                self.log(f"auto-align: {monitor.message}")
-                return candidate, monitor.message
-
-            if delta < threshold:
-                monitor.state = "aligned"
-                monitor.message = f"stable current={current:.3f}s candidate={candidate:.3f}s {detail}"
-                monitor.mismatch_offsets.clear()
-                monitor.mismatch_count = 0
-                return None, monitor.message
-
-            monitor.mismatch_offsets.append(candidate)
-            monitor.mismatch_offsets = monitor.mismatch_offsets[-required_mismatches:]
-            monitor.mismatch_count = len(monitor.mismatch_offsets)
-            stable = self._stable_mismatch_offset(monitor.mismatch_offsets)
-            if monitor.mismatch_count >= required_mismatches and stable is not None:
-                monitor.state = "realigning"
-                monitor.message = f"{monitor.mismatch_count} mismatches; new offset {stable:.3f}s {detail}"
-                self.log(f"auto-align: {monitor.message}")
-                return stable, monitor.message
-
-            monitor.state = "mismatch"
-            monitor.message = f"mismatch {monitor.mismatch_count}/{required_mismatches}: current={current:.3f}s candidate={candidate:.3f}s {detail}"
-            self.log(f"auto-align: {monitor.message}")
-            return None, monitor.message
+            return self._monitor_alignment_from_frames(video_frame, audio_frame, profile, monitor)
 
     def _refresh_runtime_auto_align_profile(self, profile):
         with self.lock:
@@ -1899,7 +1902,6 @@ class LiveManager:
         mux = self._start_mux(current_pipeline, profile, start_number=0)
 
         first_segment_deadline = time.time() + timeout
-        last_align_check = 0.0
         last_snapshot_check = 0.0
         auto_align_profile = profile.copy()
         freeze_after_aligned = parse_bool(auto_align_profile.get("auto_align_stop_after_aligned", DEFAULT_PROFILE.get("auto_align_stop_after_aligned", False)))
@@ -1932,56 +1934,71 @@ class LiveManager:
                     return f"no new HLS segment for {timeout}s (last segment {age:.1f}s ago){self._mux_failure_detail(mux, current_pipeline)}"
             elif time.time() > first_segment_deadline:
                 return f"no HLS segment created within {timeout}s{self._mux_failure_detail(mux, current_pipeline)}"
-            snapshot_interval = coerce_float(auto_align_profile.get("snapshot_interval"), DEFAULT_PROFILE["snapshot_interval"])
+            cycle_interval = coerce_float(auto_align_profile.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"], minimum=5)
             align_allowed_now = self._auto_align_allowed_by_schedule(auto_align_profile)
             if not align_allowed_now and align_monitor.state != "disabled":
                 align_monitor.state = "disabled"
                 self._set_align_monitor_status(align_monitor, "非比赛时间：直播继续，暂停自动截图和对齐")
-            if not alignment_frozen and align_allowed_now and time.time() - last_snapshot_check >= snapshot_interval and mtime:
+            if not alignment_frozen and align_allowed_now and time.time() - last_snapshot_check >= cycle_interval and mtime:
                 last_snapshot_check = time.time()
-                self._capture_runtime_snapshots(pipeline_video, pipeline_audio, auto_align_profile)
-            # Periodic auto-align
-            if not alignment_frozen and align_allowed_now and parse_bool(auto_align_profile.get("auto_align_enabled", DEFAULT_PROFILE.get("auto_align_enabled", True))):
-                a_interval = coerce_float(auto_align_profile.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"])
-                if time.time() - last_align_check >= a_interval and mtime:
-                    last_align_check = time.time()
-                    new_off, a_msg = self._monitor_alignment_once(pipeline_video, pipeline_audio, auto_align_profile, align_monitor)
-                    if new_off is not None:
-                        next_profile = auto_align_profile.copy()
-                        next_profile["offset_seconds"] = new_off
-                        try:
-                            run_id += 1
-                            current_pipeline, mux = self._handoff_pipeline(
-                                pipeline_video, pipeline_audio, next_profile,
-                                current_pipeline, mux, f"run_{run_id:03d}", source_cache=source_cache
+                frames = {}
+                try:
+                    _results, errors, frames = self._capture_runtime_snapshots_now(pipeline_video, pipeline_audio, auto_align_profile)
+                    if errors:
+                        self.log("auto snapshot failed: " + "; ".join(f"{kind}: {msg}" for kind, msg in errors.items()))
+                    if parse_bool(auto_align_profile.get("auto_align_enabled", DEFAULT_PROFILE.get("auto_align_enabled", True))):
+                        if not pipeline_audio or not pipeline_audio.url:
+                            align_monitor.state = "disabled"
+                            a_msg = "video-only; no audio clock to compare"
+                            new_off = None
+                        elif "video" not in frames or "audio" not in frames:
+                            align_monitor.state = "capture_failed"
+                            detail = "; ".join(f"{kind}: {msg}" for kind, msg in errors.items()) or "missing snapshot frame"
+                            a_msg = f"frame capture failed: {detail}"
+                            self.log(f"auto-align: {a_msg}; keeping current offset")
+                            new_off = None
+                        else:
+                            new_off, a_msg = self._monitor_alignment_from_frames(
+                                frames["video"][0], frames["audio"][0], auto_align_profile, align_monitor
                             )
-                            auto_align_profile = next_profile
-                            self._set_current_snapshot_jobs(current_pipeline, auto_align_profile)
-                            self._save_auto_offset(new_off)
-                            align_monitor.mismatch_offsets.clear()
-                            align_monitor.mismatch_count = 0
-                            align_monitor.state = "aligned"
-                            first_segment_deadline = time.time() + timeout
-                            self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete")
-                            if freeze_after_aligned:
-                                alignment_frozen = True
+                        if new_off is not None:
+                            next_profile = auto_align_profile.copy()
+                            next_profile["offset_seconds"] = new_off
+                            try:
+                                run_id += 1
+                                current_pipeline, mux = self._handoff_pipeline(
+                                    pipeline_video, pipeline_audio, next_profile,
+                                    current_pipeline, mux, f"run_{run_id:03d}", source_cache=source_cache
+                                )
+                                auto_align_profile = next_profile
+                                self._set_current_snapshot_jobs(current_pipeline, auto_align_profile)
+                                self._save_auto_offset(new_off)
+                                align_monitor.mismatch_offsets.clear()
+                                align_monitor.mismatch_count = 0
                                 align_monitor.state = "aligned"
-                                self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete; 已暂停自动截图和检查")
-                                self.log("auto-align: aligned once; paused automatic snapshots and checks")
-                        except Exception as exc:
-                            msg = f"handoff failed: {exc}; keeping current stream"
-                            self.log(msg)
-                            with self.lock:
-                                self.status["auto_align_msg"] = msg
-                                self.status["stage"] = "running"
-                            if not isinstance(exc, HandoffDeferred):
-                                return f"handoff failed: {exc}"
-                    else:
-                        self._set_align_monitor_status(align_monitor, a_msg)
-                        if freeze_after_aligned and align_monitor.state == "aligned":
-                            alignment_frozen = True
-                            self._set_align_monitor_status(align_monitor, f"{a_msg}; 已暂停自动截图和检查")
-                            self.log("auto-align: already aligned; paused automatic snapshots and checks")
+                                first_segment_deadline = time.time() + timeout
+                                self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete")
+                                if freeze_after_aligned:
+                                    alignment_frozen = True
+                                    align_monitor.state = "aligned"
+                                    self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete; 已暂停自动截图和检查")
+                                    self.log("auto-align: aligned once; paused automatic snapshots and checks")
+                            except Exception as exc:
+                                msg = f"handoff failed: {exc}; keeping current stream"
+                                self.log(msg)
+                                with self.lock:
+                                    self.status["auto_align_msg"] = msg
+                                    self.status["stage"] = "running"
+                                if not isinstance(exc, HandoffDeferred):
+                                    return f"handoff failed: {exc}"
+                        else:
+                            self._set_align_monitor_status(align_monitor, a_msg)
+                            if freeze_after_aligned and align_monitor.state == "aligned":
+                                alignment_frozen = True
+                                self._set_align_monitor_status(align_monitor, f"{a_msg}; 已暂停自动截图和检查")
+                                self.log("auto-align: already aligned; paused automatic snapshots and checks")
+                finally:
+                    self._cleanup_snapshot_frames(frames)
             time.sleep(2)
         return "stopped"
 
@@ -3029,34 +3046,23 @@ class LiveManager:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    def _capture_runtime_snapshots(self, video, audio, profile):
-        if not self.snapshot_lock.acquire(blocking=False):
-            return
+    def _runtime_snapshot_jobs(self, video, audio, profile):
+        with self.lock:
+            jobs = list(self.current_snapshot_jobs)
+        if jobs:
+            return jobs
+        timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        jobs = [("video", self._direct_input(video.url, timeout, video.headers), self.status.get("active_channel") or "active video")]
+        if audio and audio.url:
+            jobs.append(("audio", self._direct_input(audio.url, timeout, audio.headers), profile.get("audio_channel") or "active audio"))
+        return jobs
 
-        def worker():
-            try:
-                with self.lock:
-                    jobs = list(self.current_snapshot_jobs)
-                if not jobs:
-                    timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-                    jobs = [("video", self._direct_input(video.url, timeout, video.headers), self.status.get("active_channel") or "active video")]
-                    if audio and audio.url:
-                        jobs.append(("audio", self._direct_input(audio.url, timeout, audio.headers), profile.get("audio_channel") or "active audio"))
-                _, errors = self._capture_snapshot_jobs(jobs, profile)
-                if errors:
-                    self.log("auto snapshot failed: " + "; ".join(f"{kind}: {msg}" for kind, msg in errors.items()))
-            finally:
-                self.snapshot_lock.release()
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _capture_snapshot_jobs(self, jobs, profile):
+    def _capture_snapshot_frames(self, jobs, profile):
         jobs = [job for job in jobs if job[1]]
         frames = {}
-        results = {}
         errors = {}
         if not jobs:
-            return results, {"snapshot": "no snapshot URLs available"}
+            return frames, {"snapshot": "no snapshot URLs available"}
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
         with ThreadPoolExecutor(max_workers=min(2, len(jobs))) as pool:
             futures = {
@@ -3069,19 +3075,45 @@ class LiveManager:
                     frames[kind] = (fut.result(), source_name)
                 except Exception as exc:
                     errors[kind] = str(exc)
-        try:
-            for kind in ("video", "audio"):
-                if kind not in frames:
-                    continue
-                frame_path, source_name = frames[kind]
-                try:
-                    results[kind] = self._save_snapshot_from_frame(frame_path, kind, profile, source_name)
-                except Exception as exc:
-                    errors[kind] = str(exc)
-        finally:
-            for frame_path, _source_name in frames.values():
-                frame_path.unlink(missing_ok=True)
+        return frames, errors
+
+    def _save_snapshot_frames(self, frames, profile):
+        results = {}
+        errors = {}
+        for kind in ("video", "audio"):
+            if kind not in frames:
+                continue
+            frame_path, source_name = frames[kind]
+            try:
+                results[kind] = self._save_snapshot_from_frame(frame_path, kind, profile, source_name)
+            except Exception as exc:
+                errors[kind] = str(exc)
         return results, errors
+
+    def _cleanup_snapshot_frames(self, frames):
+        for frame_path, _source_name in frames.values():
+            frame_path.unlink(missing_ok=True)
+
+    def _capture_snapshot_jobs(self, jobs, profile):
+        frames, errors = self._capture_snapshot_frames(jobs, profile)
+        try:
+            results, save_errors = self._save_snapshot_frames(frames, profile)
+            errors.update(save_errors)
+        finally:
+            self._cleanup_snapshot_frames(frames)
+        return results, errors
+
+    def _capture_runtime_snapshots_now(self, video, audio, profile):
+        if not self.snapshot_lock.acquire(blocking=False):
+            return {}, {"snapshot": "snapshot capture already running"}, {}
+        try:
+            jobs = self._runtime_snapshot_jobs(video, audio, profile)
+            frames, errors = self._capture_snapshot_frames(jobs, profile)
+            results, save_errors = self._save_snapshot_frames(frames, profile)
+            errors.update(save_errors)
+            return results, errors, frames
+        finally:
+            self.snapshot_lock.release()
 
     def _prune_snapshots(self):
         keep = {"video_snapshot.jpg", "audio_snapshot.jpg"}

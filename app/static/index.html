@@ -36,11 +36,10 @@
           <label class="field"><span>本地缓存秒数</span><input name="local_cache_seconds" type="number" min="30" /></label>
           <label class="field full checkbox-field"><input name="auto_align_enabled" type="checkbox" /> <span>自动对齐（OCR）</span></label>
           <label class="field full checkbox-field"><input name="auto_align_stop_after_aligned" type="checkbox" /> <span>对齐一次后暂停自动截图和检查</span></label>
-          <label class="field"><span>检查间隔（秒）</span><input name="auto_align_interval" type="number" min="5" /></label>
+          <label class="field"><span>截图/检查间隔（秒）</span><input name="auto_align_interval" type="number" min="5" /></label>
           <label class="field"><span>连续不一致次数</span><input name="auto_align_samples" type="number" min="1" /></label>
           <label class="field"><span>允许误差（秒）</span><input name="auto_align_threshold" type="number" step="0.1" min="0.1" /></label>
           <label class="field"><span>最大偏移（秒）</span><input name="auto_align_max_offset" type="number" step="1" min="1" /></label>
-          <label class="field"><span>截图间隔（秒）</span><input name="snapshot_interval" type="number" min="10" /></label>
           <label class="field"><span>视频计时器区域</span><input name="video_roi" placeholder="x,y,w,h" autocomplete="off" /></label>
           <label class="field"><span>音频计时器区域</span><input name="audio_roi" placeholder="x,y,w,h" autocomplete="off" /></label>
           <label class="field full"><span>视频计时器预设区域（每行一个 x,y,w,h）</span><textarea name="video_roi_presets" rows="4" autocomplete="off" spellcheck="false" placeholder="0.132,0.055,0.078,0.140&#10;0.333,0.058,0.080,0.140&#10;0.114,0.049,0.077,0.077&#10;0.111,0.000,0.077,0.185"></textarea></label>
