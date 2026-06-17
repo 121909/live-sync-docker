@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>直播同步管理</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>直播同步管理</h1>
+        <p id="streamSummary">正在读取运行状态...</p>
+      </div>
+      <div class="status-cluster" aria-live="polite">
+        <span id="runBadge" class="badge">未知</span>
+        <span id="hlsBadge" class="badge">HLS 未就绪</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <form id="configForm" class="panel form-panel">
+        <div class="panel-head">
+          <h2>基础设置</h2>
+          <button id="saveConfig" type="button">保存</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="field"><span>配置名称</span><input name="name" autocomplete="off" /></label>
+          <label class="field"><span>输出频道名称</span><input name="channel_name" autocomplete="off" /></label>
+          <label class="field full"><span>视频请求头（每行一个，格式 Header: value）</span><textarea name="video_headers" rows="3" autocomplete="off" spellcheck="false" placeholder="Referer: https://example.com/&#10;Origin: https://example.com"></textarea></label>
+          <label class="field full"><span>音频请求头（每行一个，格式 Header: value）</span><textarea name="audio_headers" rows="3" autocomplete="off" spellcheck="false"></textarea></label>
+
+          <label class="field"><span>初始偏移秒</span><input name="offset_seconds" type="number" step="0.1" /></label>
+          <label class="field full checkbox-field"><input name="auto_align_enabled" type="checkbox" /> <span>自动对齐（OCR）</span></label>
+          <label class="field full checkbox-field"><input name="auto_align_stop_after_aligned" type="checkbox" /> <span>对齐一次后暂停自动截图和检查</span></label>
+          <label class="field"><span>检查间隔（秒）</span><input name="auto_align_interval" type="number" min="5" /></label>
+          <label class="field"><span>连续不一致次数</span><input name="auto_align_samples" type="number" min="1" /></label>
+          <label class="field"><span>允许误差（秒）</span><input name="auto_align_threshold" type="number" step="0.1" min="0.1" /></label>
+          <label class="field"><span>最大偏移（秒）</span><input name="auto_align_max_offset" type="number" step="1" min="1" /></label>
+          <label class="field"><span>截图间隔（秒）</span><input name="snapshot_interval" type="number" min="10" /></label>
+          <label class="field"><span>视频计时器区域</span><input name="video_roi" placeholder="x,y,w,h" autocomplete="off" /></label>
+          <label class="field"><span>音频计时器区域</span><input name="audio_roi" placeholder="x,y,w,h" autocomplete="off" /></label>
+          <label class="field full"><span>视频计时器预设区域（每行一个 x,y,w,h）</span><textarea name="video_roi_presets" rows="3" autocomplete="off" spellcheck="false" placeholder="0.015,0.045,0.135,0.104&#10;0.050,0.050,0.070,0.050"></textarea></label>
+          <label class="field full"><span>音频计时器预设区域（每行一个 x,y,w,h）</span><textarea name="audio_roi_presets" rows="3" autocomplete="off" spellcheck="false" placeholder="0.015,0.045,0.135,0.104&#10;0.885,0.085,0.075,0.060"></textarea></label>
+
+          <label class="field full checkbox-field"><input name="schedule_enabled" type="checkbox" /> <span>按赛程自动启停</span></label>
+          <label class="field full checkbox-field"><input name="auto_align_outside_match" type="checkbox" /> <span>非比赛时间直播也自动对齐</span></label>
+          <label class="field"><span>提前启动（分钟）</span><input name="schedule_pre_minutes" type="number" min="0" /></label>
+          <label class="field"><span>比赛窗口（分钟）</span><input name="schedule_duration_minutes" type="number" min="90" /></label>
+          <label class="field"><span>赛后停止（分钟）</span><input name="schedule_post_minutes" type="number" min="0" /></label>
+
+          <label class="field"><span>源超时（秒）</span><input name="timeout_seconds" type="number" min="5" /></label>
+          <label class="field"><span>失败重试次数</span><input name="retry_limit" type="number" min="1" /></label>
+          <label class="field"><span>分片时长（秒）</span><input name="segment_time" type="number" step="0.1" min="1" /></label>
+          <label class="field"><span>播放列表分片数</span><input name="playlist_size" type="number" min="3" /></label>
+        </div>
+      </form>
+
+      <section class="panel status-panel">
+        <div class="panel-head">
+          <h2>运行状态</h2>
+        </div>
+
+        <div class="status-grid">
+          <div><span>阶段</span><strong id="stage">-</strong></div>
+          <div><span>当前视频</span><strong id="activeChannel">-</strong></div>
+          <div><span>保存偏移</span><strong id="offsetValue">-</strong></div>
+          <div><span>自动对齐</span><strong id="alignStatus">关闭</strong></div>
+          <div><span>对齐状态</span><strong id="alignState">-</strong></div>
+          <div><span>计时器</span><strong id="alignMonitor">-</strong></div>
+          <div><span>最近对齐</span><strong id="lastAlignTime">-</strong></div>
+          <div><span>对齐信息</span><strong id="alignMsg">-</strong></div>
+          <div><span>最近截图</span><strong id="lastSnapshotTime">-</strong></div>
+          <div><span>赛程</span><strong id="scheduleStatus">-</strong></div>
+          <div><span>当前比赛</span><strong id="scheduleActive">-</strong></div>
+          <div><span>下一场</span><strong id="scheduleNext">-</strong></div>
+          <div><span>赛程刷新</span><strong id="scheduleRefresh">-</strong></div>
+          <div><span>赛程信息</span><strong id="scheduleMsg">-</strong></div>
+          <div><span>失败次数</span><strong id="failures">0</strong></div>
+          <div><span>分片数量</span><strong id="segmentCount">-</strong></div>
+          <div><span>播放列表</span><strong id="playlistState">-</strong></div>
+          <div><span>最新分片</span><strong id="latestSegment">-</strong></div>
+          <div><span>最近分片</span><strong id="lastSegment">-</strong></div>
+          <div><span>HLS</span><a id="hlsLink" href="/index.m3u8" target="_blank">/index.m3u8</a></div>
+          <div><span>Emby M3U</span><a id="embyLink" href="/emby.m3u" target="_blank">/emby.m3u</a></div>
+        </div>
+
+        <div class="copy-row">
+          <input id="hlsUrl" readonly value="/index.m3u8" aria-label="HLS 地址" />
+          <button id="copyHls" type="button">复制 HLS 地址</button>
+        </div>
+        <p id="lastError" class="error"></p>
+      </section>
+
+      <section class="panel full">
+        <div class="panel-head">
+          <h2>频道选择</h2>
+        </div>
+        <div class="browser-grid">
+          <section class="browser-column" aria-labelledby="videoBrowserTitle">
+            <div class="browser-head">
+              <h3 id="videoBrowserTitle">视频频道</h3>
+              <button id="refreshVideoChannels" type="button">刷新视频频道</button>
+            </div>
+            <div class="source-browser-fields">
+              <label class="field full"><span>视频 M3U 地址（每行一个）</span><textarea name="video_playlist" form="configForm" rows="3" autocomplete="off" spellcheck="false"></textarea></label>
+              <label class="field full"><span>本地视频 M3U 内容</span><textarea name="video_local_m3u" form="configForm" rows="8" autocomplete="off" spellcheck="false" placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;本地&quot;,BBC Stream 41 UHD&#10;https://example.com/stream.mpd"></textarea></label>
+              <label class="field"><span>主视频频道</span><input name="video_primary" form="configForm" autocomplete="off" /></label>
+              <label class="field"><span>备用视频频道</span><textarea name="video_fallbacks" form="configForm" rows="3" spellcheck="false"></textarea></label>
+            </div>
+            <label class="field full"><span>过滤视频频道</span><input id="videoChannelFilter" autocomplete="off" /></label>
+            <div class="channel-actions">
+              <button id="usePrimary" type="button">设为主源</button>
+              <button id="addFallback" type="button">加入备用</button>
+            </div>
+            <div id="videoChannels" class="table" role="list"></div>
+          </section>
+
+          <section class="browser-column" aria-labelledby="audioBrowserTitle">
+            <div class="browser-head">
+              <h3 id="audioBrowserTitle">音频频道</h3>
+              <button id="refreshAudioChannels" type="button">刷新音频频道</button>
+            </div>
+            <div class="source-browser-fields">
+              <label class="field full"><span>音频 M3U 地址（每行一个）</span><textarea name="audio_playlist" form="configForm" rows="3" autocomplete="off" spellcheck="false"></textarea></label>
+              <label class="field full"><span>本地音频 M3U 内容</span><textarea name="audio_local_m3u" form="configForm" rows="8" autocomplete="off" spellcheck="false" placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;本地&quot;,CCTV5&#10;http://example.com/audio.m3u8"></textarea></label>
+              <label class="field full"><span>音频频道</span><input name="audio_channel" form="configForm" autocomplete="off" /></label>
+            </div>
+            <label class="field full"><span>过滤音频频道</span><input id="audioChannelFilter" autocomplete="off" /></label>
+            <div class="channel-actions">
+              <button id="useAudio" type="button">设为音频</button>
+            </div>
+            <div id="audioChannels" class="table" role="list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel full">
+        <div class="panel-head">
+          <h2>工具 / 截图</h2>
+          <div class="inline-actions">
+            <button id="shotBoth" type="button">同步截图</button>
+            <button id="shotVideo" class="secondary" type="button">只截视频</button>
+            <button id="shotAudio" class="secondary" type="button">只截音频</button>
+            <button id="clearHls" class="danger" type="button">清理 HLS</button>
+            <button id="clearState" class="danger" type="button">清理状态</button>
+          </div>
+        </div>
+        <div id="snapshots" class="snapshots"></div>
+      </section>
+
+      <section class="panel logs-panel">
+        <div class="panel-head">
+          <h2>日志</h2>
+          <button id="refreshBtn" type="button">刷新</button>
+        </div>
+        <pre id="logOutput"></pre>
+      </section>
+    </main>
+
+    <nav class="bottom-actions" aria-label="直播控制">
+      <div class="bottom-actions-inner">
+        <button id="startBtn" class="primary" type="button">启动</button>
+        <button id="restartBtn" type="button">重启</button>
+        <button id="stopBtn" type="button">停止</button>
+        <button id="refreshSchedule" type="button">刷新赛程</button>
+      </div>
+    </nav>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

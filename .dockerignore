@@ -1,0 +1,8 @@
+state/*
+hls/*
+*.mkv
+*.mp4
+*.ts
+*.log
+__pycache__/
+.git/

@@ -1,0 +1,77 @@
+services:
+  live-sync:
+    build:
+      context: .
+    image: live-sync-cctv:latest
+    container_name: live-sync-cctv
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    ports:
+      - "${HOST_BIND:-0.0.0.0}:${PORT:-18080}:18080"
+    environment:
+      VIDEO_HEADERS: "${VIDEO_HEADERS:-}"
+      AUDIO_HEADERS: "${AUDIO_HEADERS:-}"
+      VIDEO_M3U_URL: "${VIDEO_M3U_URL:-}"
+      AUDIO_M3U_URL: "${AUDIO_M3U_URL:-}"
+      VIDEO_CHANNEL_NAME: "${VIDEO_CHANNEL_NAME:-}"
+      AUDIO_CHANNEL_NAME: "${AUDIO_CHANNEL_NAME:-}"
+      FALLBACK_VIDEO_CHANNELS: "${FALLBACK_VIDEO_CHANNELS:-}"
+      SYNC_OFFSET: "${SYNC_OFFSET:-}"
+      DEFAULT_OFFSET: "${DEFAULT_OFFSET:-10}"
+      OFFSET_STATE: /state/last_sync_offset.json
+      STATE_DIR: /state
+      SCRIPTS_ROOT: /app/scripts
+      MODE: hls
+      OUT_DIR: /hls
+      WORK_DIR: /tmp/live_4k_delay
+      PORT: "18080"
+      AUTO_START: "${AUTO_START:-0}"
+      SEGMENT_TIME: "${SEGMENT_TIME:-4}"
+      PLAYLIST_SIZE: "${PLAYLIST_SIZE:-30}"
+      HLS_SEGMENT_TYPE: "${HLS_SEGMENT_TYPE:-fmp4}"
+      STRIP_DOVI_RPU: "${STRIP_DOVI_RPU:-1}"
+      OUTPUT_AUDIO_CODEC: "${OUTPUT_AUDIO_CODEC:-aac}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
+      CHANNEL_ID: "${CHANNEL_ID:-cctv5-4k-cn}"
+      CHANNEL_NAME: "${CHANNEL_NAME:-CCTV5 4K Chinese}"
+      CHANNEL_NUMBER: "${CHANNEL_NUMBER:-5}"
+      CHANNEL_GROUP: "${CHANNEL_GROUP:-Sports}"
+      AUTO_ALIGN_ENABLED: "${AUTO_ALIGN_ENABLED:-1}"
+      AUTO_ALIGN_INTERVAL: "${AUTO_ALIGN_INTERVAL:-60}"
+      AUTO_ALIGN_SAMPLES: "${AUTO_ALIGN_SAMPLES:-3}"
+      AUTO_ALIGN_STEP: "${AUTO_ALIGN_STEP:-1}"
+      AUTO_ALIGN_THRESHOLD: "${AUTO_ALIGN_THRESHOLD:-1}"
+      AUTO_ALIGN_MAX_OFFSET: "${AUTO_ALIGN_MAX_OFFSET:-180}"
+      AUTO_ALIGN_RELOCATE_ATTEMPTS: "${AUTO_ALIGN_RELOCATE_ATTEMPTS:-3}"
+      AUTO_ALIGN_STOP_AFTER_ALIGNED: "${AUTO_ALIGN_STOP_AFTER_ALIGNED:-0}"
+      AUTO_ALIGN_OUTSIDE_MATCH: "${AUTO_ALIGN_OUTSIDE_MATCH:-0}"
+      LOG_REDACT_URLS: "${LOG_REDACT_URLS:-0}"
+      FFMPEG_USER_AGENT: "${FFMPEG_USER_AGENT:-Emby}"
+      DEFAULT_REQUEST_HEADERS: "${DEFAULT_REQUEST_HEADERS:-}"
+      SNAPSHOT_INTERVAL: "${SNAPSHOT_INTERVAL:-180}"
+      OMP_THREAD_LIMIT: "${OMP_THREAD_LIMIT:-1}"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-1}"
+      VIDEO_TIMER_ROI: "${VIDEO_TIMER_ROI:-0.050,0.050,0.070,0.050}"
+      AUDIO_TIMER_ROI: "${AUDIO_TIMER_ROI:-0.885,0.085,0.075,0.060}"
+      VIDEO_TIMER_ROI_PRESETS: "${VIDEO_TIMER_ROI_PRESETS:-}"
+      AUDIO_TIMER_ROI_PRESETS: "${AUDIO_TIMER_ROI_PRESETS:-}"
+      SCHEDULE_ENABLED: "${SCHEDULE_ENABLED:-1}"
+      SCHEDULE_PROVIDER: "${SCHEDULE_PROVIDER:-espn}"
+      SCHEDULE_LEAGUE: "${SCHEDULE_LEAGUE:-fifa.world}"
+      SCHEDULE_TIMEZONE: "${SCHEDULE_TIMEZONE:-Asia/Shanghai}"
+      SCHEDULE_REFRESH_HOURS: "${SCHEDULE_REFRESH_HOURS:-24}"
+      SCHEDULE_POLL_SECONDS: "${SCHEDULE_POLL_SECONDS:-60}"
+      SCHEDULE_PRE_MINUTES: "${SCHEDULE_PRE_MINUTES:-10}"
+      SCHEDULE_DURATION_MINUTES: "${SCHEDULE_DURATION_MINUTES:-150}"
+      SCHEDULE_POST_MINUTES: "${SCHEDULE_POST_MINUTES:-20}"
+      LIVE_SYNC_STATE_DIR: /state
+      HLS_DIR: /hls
+    volumes:
+      - ./state:/state
+      - ./hls:/hls
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
