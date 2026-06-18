@@ -301,6 +301,12 @@ def effective_segment_time(profile):
     return max(coerce_float(profile.get("segment_time"), DEFAULT_PROFILE["segment_time"], minimum=0.5), 4.0)
 
 
+def hls_stall_timeout(profile):
+    input_timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+    segment_seconds = effective_segment_time(profile)
+    return max(input_timeout, int(math.ceil(segment_seconds * 4)))
+
+
 def hls_segment_type(profile):
     value = str(profile.get("hls_segment_type", DEFAULT_PROFILE.get("hls_segment_type", "fmp4")) or "fmp4").strip().lower()
     return "mpegts" if value in ("ts", "mpegts") else "fmp4"
@@ -1169,7 +1175,7 @@ class LiveManager:
 
     def _mux_failure_detail(self, mux, pipeline):
         context = f" | context: {pipeline.video_input_label}; {pipeline.audio_input_label}"
-        tail = self._process_tail_summary(mux)
+        tail = self._process_tail_summary(mux, max_lines=12)
         return context + tail
 
     def _stop_processes(self, procs=None):
@@ -1926,6 +1932,7 @@ class LiveManager:
         WORK_DIR.mkdir(parents=True, exist_ok=True)
 
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        stall_timeout = hls_stall_timeout(profile)
         source_cache = None
         pipeline_video = video
         pipeline_audio = audio
@@ -1944,7 +1951,7 @@ class LiveManager:
         self._set_current_snapshot_jobs(current_pipeline, profile)
         mux = self._start_mux(current_pipeline, profile, start_number=0)
 
-        first_segment_deadline = time.time() + timeout
+        first_segment_deadline = time.time() + stall_timeout
         last_snapshot_check = 0.0
         auto_align_profile = profile.copy()
         freeze_after_aligned = parse_bool(auto_align_profile.get("auto_align_stop_after_aligned", DEFAULT_PROFILE.get("auto_align_stop_after_aligned", False)))
@@ -1972,11 +1979,19 @@ class LiveManager:
                 with self.lock:
                     self.status["last_segment_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
                     self.status["stage"] = "running"
-                if time.time() - mtime > timeout:
+                if time.time() - mtime > stall_timeout:
                     age = time.time() - mtime
-                    return f"no new HLS segment for {timeout}s (last segment {age:.1f}s ago){self._mux_failure_detail(mux, current_pipeline)}"
+                    return (
+                        f"no new HLS segment for {stall_timeout}s "
+                        f"(last segment {age:.1f}s ago, input timeout {timeout}s, segment {segment_seconds:.3f}s)"
+                        f"{self._mux_failure_detail(mux, current_pipeline)}"
+                    )
             elif time.time() > first_segment_deadline:
-                return f"no HLS segment created within {timeout}s{self._mux_failure_detail(mux, current_pipeline)}"
+                return (
+                    f"no HLS segment created within {stall_timeout}s "
+                    f"(input timeout {timeout}s, segment {segment_seconds:.3f}s)"
+                    f"{self._mux_failure_detail(mux, current_pipeline)}"
+                )
             cycle_interval = coerce_float(auto_align_profile.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"], minimum=5)
             align_allowed_now = self._auto_align_allowed_by_schedule(auto_align_profile)
             if not align_allowed_now and align_monitor.state != "disabled":
