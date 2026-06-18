@@ -509,6 +509,7 @@ class PreparedPipeline:
     audio_input: list
     delay_procs: list
     audio_map: str = ""
+    audio_copy_bsf: str = ""
     single_input_av: bool = False
     video_codec: str = ""
     compatible_mux: bool = False
@@ -1274,6 +1275,27 @@ class LiveManager:
         codec = result.stdout.strip().splitlines()
         return codec[0].strip().lower() if codec else ""
 
+    def _probe_audio_codec(self, channel, timeout):
+        if not channel or not channel.url:
+            return ""
+        cmd = [
+            "ffprobe", "-hide_banner", "-loglevel", "error",
+            "-rw_timeout", str(timeout * 1_000_000),
+            *self._http_input_options(channel.url, channel.headers),
+            *self._local_hls_input_options(channel.url, -1),
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            channel.url,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5, check=True)
+        except Exception as exc:
+            self.log(f"audio codec probe failed for {channel.name}: {exc}; using generic copy path")
+            return ""
+        codec = result.stdout.strip().splitlines()
+        return codec[0].strip().lower() if codec else ""
+
     def _video_copy_args(self, codec):
         args = ["-c:v", "copy"]
         if codec in ("hevc", "h265"):
@@ -1281,6 +1303,15 @@ class LiveManager:
             if strip_dovi_rpu():
                 args += ["-bsf:v", "filter_units=remove_types=62"]
         return args
+
+    def _input_is_hls(self, input_args):
+        if not input_args:
+            return False
+        for idx, arg in enumerate(input_args):
+            if arg == "-i" and idx + 1 < len(input_args):
+                source = str(input_args[idx + 1]).strip().lower()
+                return source.endswith(".m3u8")
+        return False
 
     def _start_local_cache_recorder(self, channel, playlist, profile, kind):
         segment = f"{effective_segment_time(profile):.3f}"
@@ -1403,7 +1434,9 @@ class LiveManager:
         segment = f"{segment_seconds:.3f}"
         delay_procs = []
         video_codec = self._probe_video_codec(video, timeout)
+        audio_codec = self._probe_audio_codec(audio, timeout) if audio_url else ""
         compatible_mux = video_codec not in ("hevc", "h265")
+        mux_segment_type = "mpegts" if compatible_mux else hls_segment_type(profile)
         if video_codec:
             mux_mode = "mpegts compatibility" if compatible_mux else "configured HLS"
             self.log(f"video codec detected: {video_codec}; mux mode: {mux_mode}")
@@ -1435,6 +1468,7 @@ class LiveManager:
             audio_input_label = "input1=none"
         video_snapshot_input = list(video_input)
         audio_snapshot_input = list(video_input if single_input_av else audio_input)
+        audio_copy_bsf = ""
 
         try:
             if offset >= 0.5:
@@ -1463,6 +1497,12 @@ class LiveManager:
             shutil.rmtree(run_dir, ignore_errors=True)
             raise
 
+        audio_copy_bsf = ""
+        if audio_map and output_audio_codec() == "copy":
+            source_input = video_input if single_input_av else audio_input
+            if audio_codec == "aac" and mux_segment_type == "fmp4" and self._input_is_hls(source_input):
+                audio_copy_bsf = "aac_adtstoasc"
+
         return PreparedPipeline(
             offset=offset,
             run_dir=run_dir,
@@ -1470,6 +1510,7 @@ class LiveManager:
             audio_input=audio_input,
             delay_procs=delay_procs,
             audio_map=audio_map,
+            audio_copy_bsf=audio_copy_bsf,
             single_input_av=single_input_av,
             video_codec=video_codec,
             compatible_mux=compatible_mux,
@@ -1510,6 +1551,8 @@ class LiveManager:
         if prepared.audio_map:
             if output_audio_codec() == "copy":
                 cmd += ["-c:a", "copy"]
+                if prepared.audio_copy_bsf:
+                    cmd += ["-bsf:a", prepared.audio_copy_bsf]
             else:
                 cmd += ["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"]
         cmd += [
