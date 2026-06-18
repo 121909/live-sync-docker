@@ -868,8 +868,14 @@ class LiveManager:
 
     def normalize_profile(self, profile, save=False):
         raw_profile = profile or {}
-        merged = DEFAULT_PROFILE.copy()
-        merged.update(raw_profile)
+        # Start from current saved profile to preserve existing values on partial updates
+        if hasattr(self, 'profile') and self.profile:
+            merged = self.profile.copy()
+            merged.update(DEFAULT_PROFILE)
+            merged.update(raw_profile)
+        else:
+            merged = DEFAULT_PROFILE.copy()
+            merged.update(raw_profile)
         merged["video_url"] = str(merged.get("video_url", "") or "")
         merged["audio_url"] = str(merged.get("audio_url", "") or "")
         merged["video_headers"] = str(merged.get("video_headers", "") or "")
