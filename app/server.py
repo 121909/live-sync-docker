@@ -1430,6 +1430,33 @@ class LiveManager:
             raise RuntimeError("stopped")
         if recorder.poll() is not None:
             raise RuntimeError(f"{stage} exited with code {recorder.returncode}")
+    def _buffer_delay_input(self, recorder, playlist, offset, timeout, stage):
+        started = time.time()
+        self._wait_for_playlist(playlist, recorder, timeout, stage)
+        remaining = max(0, abs(offset) - (time.time() - started))
+        with self.lock:
+            self.status["stage"] = f"{stage} {abs(offset):.1f}s"
+        while remaining > 0 and not self.stop_event.is_set() and recorder.poll() is None:
+            sleep_for = min(1, remaining)
+            time.sleep(sleep_for)
+            remaining -= sleep_for
+        if self.stop_event.is_set():
+            raise RuntimeError("stopped")
+        if recorder.poll() is not None:
+            raise RuntimeError(f"{stage} exited with code {recorder.returncode}")
+        # Ensure at least one segment file exists before letting mux consume this playlist
+        deadline = time.time() + max(30, timeout)
+        while time.time() < deadline and not self.stop_event.is_set():
+            segments = self._playlist_segments(playlist)
+            ready = [seg for seg in segments if (playlist.parent / seg).exists()]
+            if ready:
+                return
+            if recorder.poll() is not None:
+                raise RuntimeError(f"{stage} exited with code {recorder.returncode} (no segments)")
+            time.sleep(0.5)
+        if self.stop_event.is_set():
+            raise RuntimeError("stopped")
+        raise RuntimeError(f"{stage} produced no segments within timeout")
 
     def _direct_input(self, url, timeout, headers=None, live_start_index=None):
         if live_start_index is None:
