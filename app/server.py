@@ -70,7 +70,7 @@ DEFAULT_VIDEO_TIMER_ROI_PRESETS = "\n".join([
 DEFAULT_AUDIO_TIMER_ROI_PRESETS = "0.824,0.080,0.078,0.140"
 TIMER_ROI_SCAN_INTERVAL_SECONDS = 30
 TIMER_ROI_SCAN_WINDOW_SECONDS = 300
-TIMER_ROI_PREVIEW_MULTIPLIER = 3.0
+TIMER_ROI_PREVIEW_MULTIPLIER = 9.0
 
 
 def env(name, default=""):
@@ -564,7 +564,7 @@ class AlignmentMonitor:
     audio_search_started_at: float = 0.0
 
     def locked(self):
-        return self.video_roi is not None and self.audio_roi is not None
+        return self.video_roi_locked and self.audio_roi_locked
 
     def snapshot(self):
         return {
@@ -1916,8 +1916,8 @@ class LiveManager:
                 return sample
         return None
 
-    def _find_frame_clock(self, frame_path):
-        found = self._find_clock_in_frame(frame_path)
+    def _find_frame_clock(self, frame_path, *, full_frame=False):
+        found = self._find_clock_in_frame(frame_path, full_frame=full_frame)
         if not found:
             return None
         return ClockSample(0.0, found[0], found[1], found[2])
@@ -1947,22 +1947,23 @@ class LiveManager:
                     return ClockSample(0.0, 0, entry.get("clock", ""), roi), "cache"
                 except (TypeError, ValueError):
                     pass
-        # 2. Profile manual ROI (legacy override)
-        roi_key = "audio_roi" if kind == "audio" else "video_roi"
-        try:
-            manual_roi = parse_roi(profile.get(roi_key, DEFAULT_PROFILE[roi_key]))
-            sample = self._read_locked_clock(frame_path, manual_roi)
-            if sample:
-                return sample, "manual"
-        except (TypeError, ValueError):
-            pass
-        # 3. Preset ROIs
+        # 2. Preset ROIs (first-run fallback)
         sample = self._read_preset_clock(frame_path, profile, kind)
         if sample:
             chan = Channel(name=channel_name)
             self._save_channel_roi(kind, chan, sample, "preset", frame_path=frame_path, key=ch_key)
             return sample, "preset"
-        # 4. Full scan / rate-limited probe
+        # 3. Profile manual ROI (legacy override)
+        roi_key = "audio_roi" if kind == "audio" else "video_roi"
+        try:
+            manual_roi = parse_roi(profile.get(roi_key, DEFAULT_PROFILE[roi_key]))
+            sample = self._read_locked_clock(frame_path, manual_roi)
+            if sample:
+                chan = Channel(name=channel_name)
+                self._save_channel_roi(kind, chan, sample, "manual", frame_path=frame_path, key=ch_key)
+                return sample, "manual"
+        except (TypeError, ValueError):
+            pass
         now = time.time()
         probe_at = monitor.video_next_probe_at if kind == "video" else monitor.audio_next_probe_at
         search_started = monitor.video_search_started_at if kind == "video" else monitor.audio_search_started_at
@@ -1975,7 +1976,7 @@ class LiveManager:
                 monitor.video_search_started_at = now
             else:
                 monitor.audio_search_started_at = now
-        sample = self._find_frame_clock(frame_path)
+        sample = self._find_frame_clock(frame_path, full_frame=True)
         if kind == "video":
             monitor.video_next_probe_at = now + TIMER_ROI_SCAN_INTERVAL_SECONDS
         else:
@@ -2020,31 +2021,28 @@ class LiveManager:
         current = float(profile.get("offset_seconds", 0) or 0)
         monitor.checks += 1
 
-        # Resolve video ROI from channel cache / presets / scan
-        if not monitor.video_roi:
+        if not monitor.video_roi_locked:
             sample, source = self._resolve_monitor_roi_for_frame(video_frame, "video", profile, monitor, monitor.video_channel)
             if sample:
                 self._lock_monitor_roi(monitor, "video", sample, profile, source)
 
-        # Resolve audio ROI
-        if not monitor.audio_roi:
+        if not monitor.audio_roi_locked:
             sample, source = self._resolve_monitor_roi_for_frame(audio_frame, "audio", profile, monitor, monitor.audio_channel)
             if sample:
                 self._lock_monitor_roi(monitor, "audio", sample, profile, source)
 
-        # Not fully locked yet
         if not monitor.locked():
             monitor.state = "acquiring"
             missing = []
             now_t = time.time()
-            if not monitor.video_roi:
+            if not monitor.video_roi_locked:
                 detail = ""
                 if monitor.video_search_started_at:
                     remain = max(0, TIMER_ROI_SCAN_WINDOW_SECONDS - (now_t - monitor.video_search_started_at))
                     if remain > 0:
                         detail = f" (scan {int(remain)}s)"
                 missing.append("video" + detail)
-            if not monitor.audio_roi:
+            if not monitor.audio_roi_locked:
                 detail = ""
                 if monitor.audio_search_started_at:
                     remain = max(0, TIMER_ROI_SCAN_WINDOW_SECONDS - (now_t - monitor.audio_search_started_at))
@@ -2057,38 +2055,28 @@ class LiveManager:
         video_sample = self._read_locked_clock(video_frame, monitor.video_roi)
         audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi)
 
-        if video_sample and not monitor.video_roi_locked:
-            monitor.video_roi_locked = True
-            monitor.video_clock = video_sample.text
-            self.log(f"auto-align: locked video ROI {self._format_roi_value(video_sample.roi)} ({video_sample.text})")
-        if audio_sample and not monitor.audio_roi_locked:
-            monitor.audio_roi_locked = True
-            monitor.audio_clock = audio_sample.text
-            self.log(f"auto-align: locked audio ROI {self._format_roi_value(audio_sample.roi)} ({audio_sample.text})")
-
-        # Timer temporarily missing in locked ROI (halftime etc.)
         if not video_sample or not audio_sample:
             if not video_sample:
                 monitor.video_missing_count += 1
+            else:
+                monitor.video_missing_count = 0
             if not audio_sample:
                 monitor.audio_missing_count += 1
+            else:
+                monitor.audio_missing_count = 0
             total_missing = max(monitor.video_missing_count, monitor.audio_missing_count)
+            monitor.state = "locked"
             if total_missing >= 3:
-                monitor.state = "locked"
                 monitor.message = f"timer missing for {total_missing} checks; waiting"
             else:
-                monitor.state = "locked"
                 monitor.message = f"timer missing ({total_missing}/3)"
             return None, monitor.message
 
-        # Both clocks readable - reset missing counters
-        if video_sample:
-            monitor.video_missing_count = 0
-        if audio_sample:
-            monitor.audio_missing_count = 0
-
+        monitor.video_missing_count = 0
+        monitor.audio_missing_count = 0
         monitor.video_clock = video_sample.text
         monitor.audio_clock = audio_sample.text
+
         candidate, detail = self._candidate_offset_from_samples(video_sample, audio_sample, profile)
         if candidate is None:
             monitor.state = "locked"
@@ -2161,6 +2149,7 @@ class LiveManager:
 
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
         stall_timeout = hls_stall_timeout(profile)
+        segment_seconds = effective_segment_time(profile)
         source_cache = None
         pipeline_video = video
         pipeline_audio = audio
@@ -2182,8 +2171,6 @@ class LiveManager:
         first_segment_deadline = time.time() + stall_timeout
         last_snapshot_check = 0.0
         auto_align_profile = profile.copy()
-        freeze_after_aligned = parse_bool(auto_align_profile.get("auto_align_stop_after_aligned", DEFAULT_PROFILE.get("auto_align_stop_after_aligned", False)))
-        alignment_frozen = False
         align_monitor = AlignmentMonitor()
         align_monitor.video_channel = video.name if video else ""
         align_monitor.audio_channel = audio.name if audio and audio.url else ""
@@ -2203,7 +2190,6 @@ class LiveManager:
             self.status["auto_align_monitor"] = align_monitor.snapshot()
         while not self.stop_event.is_set():
             auto_align_profile = self._refresh_runtime_auto_align_profile(auto_align_profile)
-            freeze_after_aligned = parse_bool(auto_align_profile.get("auto_align_stop_after_aligned", DEFAULT_PROFILE.get("auto_align_stop_after_aligned", False)))
             if mux.poll() is not None:
                 return f"ffmpeg exited with code {mux.returncode}{self._mux_failure_detail(mux, current_pipeline)}"
             mtime = self._latest_hls_mtime()
@@ -2229,7 +2215,8 @@ class LiveManager:
             if not align_allowed_now and align_monitor.state != "disabled":
                 align_monitor.state = "disabled"
                 self._set_align_monitor_status(align_monitor, "非比赛时间：直播继续，暂停自动截图和对齐")
-            if not alignment_frozen and align_allowed_now and time.time() - last_snapshot_check >= cycle_interval and mtime:
+            probe_interval = cycle_interval if align_monitor.locked() else TIMER_ROI_SCAN_INTERVAL_SECONDS
+            if align_allowed_now and time.time() - last_snapshot_check >= probe_interval and mtime:
                 last_snapshot_check = time.time()
                 frames = {}
                 try:
@@ -2268,11 +2255,6 @@ class LiveManager:
                                 align_monitor.state = "aligned"
                                 first_segment_deadline = time.time() + timeout
                                 self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete")
-                                if freeze_after_aligned:
-                                    alignment_frozen = True
-                                    align_monitor.state = "aligned"
-                                    self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete; 已暂停自动截图和检查")
-                                    self.log("auto-align: aligned once; paused automatic snapshots and checks")
                             except Exception as exc:
                                 msg = f"handoff failed: {exc}; keeping current stream"
                                 self.log(msg)
@@ -2283,10 +2265,6 @@ class LiveManager:
                                     return f"handoff failed: {exc}"
                         else:
                             self._set_align_monitor_status(align_monitor, a_msg)
-                            if freeze_after_aligned and align_monitor.state == "aligned":
-                                alignment_frozen = True
-                                self._set_align_monitor_status(align_monitor, f"{a_msg}; 已暂停自动截图和检查")
-                                self.log("auto-align: already aligned; paused automatic snapshots and checks")
                 finally:
                     self._cleanup_snapshot_frames(frames)
             time.sleep(2)
@@ -2935,15 +2913,19 @@ class LiveManager:
             return None
         return (x0 / frame_w, y0 / frame_h, (x1 - x0) / frame_w, (y1 - y0) / frame_h)
 
-    def _find_clock_in_frame(self, frame_path):
+    def _find_clock_in_frame(self, frame_path, full_frame=False):
         img = cv2.imread(str(frame_path))
         if img is None:
             return None
         h, w = img.shape[:2]
-        # Match clocks are expected near broadcast scoreboards; scanning only the
-        # top third avoids replay graphics and lowers OCR CPU.
-        scan_h = max(1, h // 3)
-        scan = img[:scan_h, :]
+        if full_frame:
+            scan_h = h
+            scan = img
+        else:
+            # Match clocks are expected near broadcast scoreboards; scanning only the
+            # top third avoids replay graphics and lowers OCR CPU.
+            scan_h = max(1, h // 3)
+            scan = img[:scan_h, :]
         scale = min(1.0, 1280.0 / max(w, scan_h))
         work = cv2.resize(scan, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else scan
         processed = self._preprocess_ocr_image(work, scale=2)
@@ -3023,7 +3005,7 @@ class LiveManager:
                     if parsed:
                         samples.append(ClockSample(t, parsed[0], parsed[1], roi))
                     elif auto_find:
-                        found = self._find_clock_in_frame(out)
+                        found = self._find_clock_in_frame(out, full_frame=True)
                         if found:
                             samples.append(ClockSample(t, found[0], found[1], found[2]))
                 except Exception:
@@ -3286,7 +3268,7 @@ class LiveManager:
                     parsed = (preset_sample.game_time, preset_sample.text)
                     found_roi = preset_sample.roi
             if not parsed:
-                found = self._find_clock_in_frame(frame_path)
+                found = self._find_clock_in_frame(frame_path, full_frame=True)
                 if found and self._roi_center_distance(found[2], roi) <= 0.18:
                     parsed = (found[0], found[1])
                     found_roi = found[2]
@@ -3294,7 +3276,7 @@ class LiveManager:
             out = SNAPSHOT_DIR / f"{kind}_snapshot.jpg"
             tmp_out = SNAPSHOT_DIR / f".{kind}_snapshot.tmp.jpg"
             if parsed:
-                crop = self._roi_crop(frame_path, found_roi or roi)
+                crop = self._roi_crop(frame_path, self._timer_preview_roi(found_roi or roi))
                 if crop is not None:
                     cv2.imwrite(str(tmp_out), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
                 else:
@@ -3427,7 +3409,7 @@ class LiveManager:
 
     def capture_snapshots(self):
         profile = self.get_profile()
-        if not self.snapshot_lock.acquire(blocking=False):
+        if not self.snapshot_lock.acquire(timeout=5):
             raise RuntimeError("snapshot capture already running")
         try:
             with self.lock:
@@ -3450,7 +3432,7 @@ class LiveManager:
 
     def capture_snapshot(self, kind):
         profile = self.get_profile()
-        if not self.snapshot_lock.acquire(blocking=False):
+        if not self.snapshot_lock.acquire(timeout=5):
             raise RuntimeError("snapshot capture already running")
         try:
             with self.lock:
