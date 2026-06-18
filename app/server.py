@@ -1944,22 +1944,26 @@ class LiveManager:
                         roi = parse_roi(",".join(str(p) for p in raw))
                     else:
                         roi = parse_roi(str(raw))
-                    return ClockSample(0.0, 0, entry.get("clock", ""), roi), "cache"
+                    if self._clock_candidate_roi_plausible(roi):
+                        sample = self._read_locked_clock(frame_path, roi)
+                        if sample:
+                            return sample, "cache"
                 except (TypeError, ValueError):
                     pass
         # 2. Preset ROIs (first-run fallback)
         sample = self._read_preset_clock(frame_path, profile, kind)
         if sample:
-            chan = Channel(name=channel_name)
+            chan = Channel(name=channel_name, url="")
             self._save_channel_roi(kind, chan, sample, "preset", frame_path=frame_path, key=ch_key)
             return sample, "preset"
         # 3. Profile manual ROI (legacy override)
         roi_key = "audio_roi" if kind == "audio" else "video_roi"
         try:
             manual_roi = parse_roi(profile.get(roi_key, DEFAULT_PROFILE[roi_key]))
-            sample = self._read_locked_clock(frame_path, manual_roi)
-            if sample:
-                chan = Channel(name=channel_name)
+            if self._clock_candidate_roi_plausible(manual_roi):
+                sample = self._read_locked_clock(frame_path, manual_roi)
+                if sample:
+                    chan = Channel(name=channel_name, url="")
                 self._save_channel_roi(kind, chan, sample, "manual", frame_path=frame_path, key=ch_key)
                 return sample, "manual"
         except (TypeError, ValueError):
@@ -1982,7 +1986,7 @@ class LiveManager:
         else:
             monitor.audio_next_probe_at = now + TIMER_ROI_SCAN_INTERVAL_SECONDS
         if sample:
-            chan = Channel(name=channel_name)
+            chan = Channel(name=channel_name, url="")
             self._save_channel_roi(kind, chan, sample, "scan", frame_path=frame_path, key=ch_key)
             return sample, "scan"
         return None, ""
@@ -2067,7 +2071,48 @@ class LiveManager:
             total_missing = max(monitor.video_missing_count, monitor.audio_missing_count)
             monitor.state = "locked"
             if total_missing >= 3:
-                monitor.message = f"timer missing for {total_missing} checks; waiting"
+                # Try to re-find ROI for sides that have been missing for 3+ checks
+                # (stay in "locked" state — could be halftime, don't go back to acquiring)
+                if monitor.video_missing_count >= 3:
+                    sample, source = self._resolve_monitor_roi_for_frame(video_frame, "video", profile, monitor, monitor.video_channel)
+                    if sample:
+                        self._lock_monitor_roi(monitor, "video", sample, profile, source)
+                        monitor.video_missing_count = 0
+                if monitor.audio_missing_count >= 3:
+                    sample, source = self._resolve_monitor_roi_for_frame(audio_frame, "audio", profile, monitor, monitor.audio_channel)
+                    if sample:
+                        self._lock_monitor_roi(monitor, "audio", sample, profile, source)
+                        monitor.audio_missing_count = 0
+                # Re-read after potential re-lock
+                if monitor.video_missing_count == 0:
+                    video_sample = self._read_locked_clock(video_frame, monitor.video_roi)
+                if monitor.audio_missing_count == 0:
+                    audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi)
+                if video_sample and audio_sample:
+                    # Found both timers after re-find; proceed to alignment check
+                    monitor.video_missing_count = 0
+                    monitor.audio_missing_count = 0
+                    monitor.video_clock = video_sample.text
+                    monitor.audio_clock = audio_sample.text
+                    candidate, detail = self._candidate_offset_from_samples(video_sample, audio_sample, profile)
+                    if candidate is None:
+                        monitor.message = detail
+                        return None, monitor.message
+                    current = float(profile.get("offset_seconds", 0) or 0)
+                    delta = abs(candidate - current)
+                    if delta < profile.get("auto_align_threshold", 1.0):
+                        monitor.state = "aligned"
+                        monitor.message = f"stable current={current:.3f}s candidate={candidate:.3f}s {detail}"
+                        return None, monitor.message
+                    monitor.state = "realigning"
+                    monitor.message = f"reacquired; new offset {candidate:.3f}s {detail}"
+                    return candidate, monitor.message
+                missing = []
+                if not video_sample:
+                    missing.append("video")
+                if not audio_sample:
+                    missing.append("audio")
+                monitor.message = f"timer missing for {total_missing} checks; scanning {', '.join(missing)}"
             else:
                 monitor.message = f"timer missing ({total_missing}/3)"
             return None, monitor.message
@@ -2913,6 +2958,27 @@ class LiveManager:
             return None
         return (x0 / frame_w, y0 / frame_h, (x1 - x0) / frame_w, (y1 - y0) / frame_h)
 
+    def _clock_candidate_roi_plausible(self, roi, parsed=None):
+        if not roi:
+            return False
+        x, y, w, h = roi
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > 1.001 or y + h > 1.001:
+            return False
+        if w < 0.012 or h < 0.010:
+            return False
+        if w > 0.24 or h > 0.20 or w * h > 0.035:
+            return False
+        ratio = w / h
+        if ratio < 0.35 or ratio > 10:
+            return False
+        text = getattr(parsed, "text", "") if parsed else ""
+        if "." in text and ":" not in text and "：" not in text and "+" not in text:
+            # Dot-only OCR hits are common on signs and jersey graphics. Accept them
+            # only when the detected box is still compact and near scoreboard areas.
+            if w > 0.12 or h > 0.10 or y > 0.45:
+                return False
+        return True
+
     def _find_clock_in_frame(self, frame_path, full_frame=False):
         img = cv2.imread(str(frame_path))
         if img is None:
@@ -2949,7 +3015,7 @@ class LiveManager:
                 height / src_scale,
                 w, h,
             )
-            if roi:
+            if roi and self._clock_candidate_roi_plausible(roi, parsed):
                 candidates.append((conf + 20, parsed, roi))
         for rows in rows_by_psm:
             for i, row in enumerate(rows):
@@ -2980,7 +3046,7 @@ class LiveManager:
                         height / src_scale,
                         w, h
                     )
-                    if roi:
+                    if roi and self._clock_candidate_roi_plausible(roi, parsed):
                         candidates.append((conf, parsed, roi))
         if not candidates:
             return None
