@@ -243,7 +243,7 @@ def make_default_profile():
         "schedule_post_minutes": int(env("SCHEDULE_POST_MINUTES", "20") or 20),
         "auto_align_outside_match": auto_align_outside_match,
         "align_only_during_match": not auto_align_outside_match,
-        "ocr_provider": env("OCR_PROVIDER", "tesseract").strip().lower(),
+        "ocr_provider": env("OCR_PROVIDER", "ocrspace").strip().lower(),
         "ocr_api_key": env("OCR_API_KEY", "").strip(),
     }
 
@@ -1954,6 +1954,14 @@ class LiveManager:
         return None
 
     def _find_frame_clock(self, frame_path, *, full_frame=False):
+        # Use OCR.space smart scan when configured (no ROI known yet)
+        profile = self.get_profile()
+        api_key = coerce_text(profile.get("ocr_api_key", "")).strip()
+        if api_key and coerce_text(profile.get("ocr_provider", "")).strip().lower() == "ocrspace":
+            found = self._find_clock_via_ocrspace(frame_path, profile)
+            if found:
+                return ClockSample(0.0, found[0], found[1], found[2])
+        # Fallback: local tesseract full-frame scan
         found = self._find_clock_in_frame(frame_path, full_frame=full_frame)
         if not found:
             return None
@@ -2297,7 +2305,17 @@ class LiveManager:
             if not align_allowed_now and align_monitor.state != "disabled":
                 align_monitor.state = "disabled"
                 self._set_align_monitor_status(align_monitor, "非比赛时间：直播继续，暂停自动截图和对齐")
-            probe_interval = cycle_interval if align_monitor.locked() else TIMER_ROI_SCAN_INTERVAL_SECONDS
+            api_key = coerce_text(auto_align_profile.get("ocr_api_key", "")).strip()
+            if not api_key:
+                align_monitor.state = "disabled"
+                self._set_align_monitor_status(align_monitor, "OCR 未配置 API Key，暂停自动对齐")
+            # Adaptive frequency: high before alignment, low after
+            if align_monitor.state == "aligned":
+                probe_interval = max(cycle_interval * 5, 300)
+            elif align_monitor.locked():
+                probe_interval = max(cycle_interval // 2, 15)
+            else:
+                probe_interval = TIMER_ROI_SCAN_INTERVAL_SECONDS
             if align_allowed_now and time.time() - last_snapshot_check >= probe_interval and mtime:
                 last_snapshot_check = time.time()
                 frames = {}
@@ -2802,13 +2820,15 @@ class LiveManager:
     def _ocr_time(self, frame_path, roi, scale=6):
         # Use a fresh profile snapshot for OCR provider config
         profile = self.get_profile()
-        provider = coerce_text(profile.get("ocr_provider", DEFAULT_PROFILE["ocr_provider"])).strip().lower()
         api_key = coerce_text(profile.get("ocr_api_key", DEFAULT_PROFILE["ocr_api_key"])).strip()
-        if provider == "openai" and api_key:
-            result = self._ocr_via_openai(frame_path, roi, profile)
+        if not api_key:
+            return None
+        provider = coerce_text(profile.get("ocr_provider", DEFAULT_PROFILE["ocr_provider"])).strip().lower()
+        if provider == "ocrspace":
+            result = self._ocr_via_ocrspace(frame_path, roi, profile)
             if result:
                 return result
-            self.log("OCR API failed, falling back to local tesseract")
+            self.log("OCR.space failed, falling back to local tesseract")
         # Local Tesseract fallback
         img = cv2.imread(str(frame_path))
         if img is None:
@@ -2843,8 +2863,51 @@ class LiveManager:
         return parsed.game_time, parsed.text
 
 
-    def _ocr_via_openai(self, frame_path, roi, profile):
-        """Send ROI crop to OpenAI Vision API and return parsed clock."""
+    def _ocr_send_ocrspace_jpeg(self, jpeg_buf, api_key):
+        """Send a JPEG buffer to OCR.space, return (text, left_ratio) or None."""
+        import base64, json as _json, urllib.request
+        b64 = base64.b64encode(jpeg_buf).decode("utf-8")
+        data = urllib.parse.urlencode({
+            "apikey": api_key,
+            "base64Image": f"data:image/jpeg;base64,{b64}",
+            "language": "eng",
+            "isOverlayRequired": "true",
+            "OCREngine": "2",
+            "detectOrientation": "false",
+            "scale": "false",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.ocr.space/parse/image",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                result = _json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            self.log(f"OCR.space API error: {exc}")
+            return None
+        if result.get("IsErroredOnProcessing") or result.get("OCRExitCode") != 1:
+            err = result.get("ErrorMessage", ["unknown"])[0] if isinstance(result.get("ErrorMessage"), list) else str(result.get("ErrorMessage", "unknown"))
+            self.log(f"OCR.space processing error: {err}")
+            return None
+        parsed_items = result.get("ParsedResults") or []
+        if not parsed_items:
+            return None
+        parsed_text = (parsed_items[0].get("ParsedText") or "").strip()
+        if not parsed_text:
+            return None
+        left_ratio = None
+        overlay = parsed_items[0].get("TextOverlay") or {}
+        lines = overlay.get("Lines") or []
+        if lines and lines[0].get("Words"):
+            img_w = float(overlay.get("ImageWidth", 1) or 1)
+            word = lines[0]["Words"][0]
+            left_ratio = float(word.get("Left", 0)) / max(img_w, 1)
+        return parsed_text, left_ratio
+
+    def _ocr_via_ocrspace(self, frame_path, roi, profile):
+        """Send cropped region to OCR.space and return parsed clock."""
         api_key = coerce_text(profile.get("ocr_api_key", ""))
         if not api_key:
             return None
@@ -2856,47 +2919,82 @@ class LiveManager:
         crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
         if crop.size == 0:
             return None
-        # Encode to JPEG base64
-        import base64
-        _, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        b64 = base64.b64encode(buf).decode("utf-8")
-        data_url = f"data:image/jpeg;base64,{b64}"
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Read the game timer number from this broadcast scoreboard image. Return ONLY the digits, colon and plus sign. Examples: 77:18, 45:00+02:13, 90:00. Do not add any explanation or extra text."},
-                        {"type": "image_url", "image_url": {"url": data_url}}
-                    ]
-                }
-            ],
-            "max_tokens": 20,
-            "temperature": 0,
-        }
-        import json, urllib.request
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-            raw = result["choices"][0]["message"]["content"].strip()
-        except Exception as exc:
-            self.log(f"OCR API failed: {exc}")
+        import cv2 as _cv2
+        _, buf = _cv2.imencode(".jpg", crop, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
+        result = self._ocr_send_ocrspace_jpeg(buf, api_key)
+        if result is None:
             return None
-        if not raw:
-            return None
-        parsed = self._parse_clock_text(raw)
-        if parsed:
-            return parsed.game_time, parsed.text
+        raw_text, _left_ratio = result
+        for line in raw_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parsed = self._parse_clock_text(line)
+            if parsed:
+                return parsed.game_time, parsed.text
         return None
+
+    def _find_clock_via_ocrspace(self, frame_path, profile):
+        """Smart scan: send top half, then quarter based on position. Returns (game_time, text, roi)."""
+        api_key = coerce_text(profile.get("ocr_api_key", ""))
+        if not api_key:
+            return None
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        # Step 1: send top half
+        top_half = img[:h//2, :]
+        import cv2 as _cv2
+        _, buf = _cv2.imencode(".jpg", top_half, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
+        result = self._ocr_send_ocrspace_jpeg(buf, api_key)
+        if result is None:
+            return None
+        raw_text, left_ratio = result
+        parsed = None
+        for line in raw_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            p = self._parse_clock_text(line)
+            if p:
+                parsed = p
+                break
+        if not parsed:
+            return None
+        # Step 2: determine which quarter based on left_ratio
+        if left_ratio is not None and left_ratio < 0.5:
+            # Timer in left half → scan top-left quarter next
+            quarter = img[:h//2, :w//2]
+        else:
+            # Timer in right half → scan top-right quarter next
+            quarter = img[:h//2, w//2:]
+        _, buf2 = _cv2.imencode(".jpg", quarter, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
+        result2 = self._ocr_send_ocrspace_jpeg(buf2, api_key)
+        if result2 is None:
+            return None
+        raw_text2, _ = result2
+        parsed2 = None
+        for line in raw_text2.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            p = self._parse_clock_text(line)
+            if p:
+                parsed2 = p
+                break
+        if not parsed2:
+            return None
+        # Compute ROI from quarter position
+        if left_ratio is not None and left_ratio < 0.5:
+            rx, ry = 0.0, 0.0
+        else:
+            rx, ry = 0.5, 0.0
+        rw, rh = 0.5, 0.5
+        # Narrow further: assume clock is roughly in center 60% of the quarter
+        pad = 0.2
+        roi = (rx + pad * rw, ry + pad * rh, rw * (1 - 2 * pad), rh * (1 - 2 * pad))
+        return parsed2.game_time, parsed2.text, roi
 
     def _roi_crop(self, frame_path, roi):
         img = cv2.imread(str(frame_path))
