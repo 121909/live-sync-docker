@@ -228,6 +228,7 @@ async function refresh() {
   updateStatus(status);
   document.querySelector("#logOutput").textContent = (logs.lines || []).join("\n") || "暂无日志。";
   renderSnapshots(snapshots.snapshots || []);
+  loadTimerRois().catch(() => {});
   autoLoadChannelsOnce().catch(() => {});
 }
 
@@ -268,6 +269,79 @@ function renderSnapshots(snapshots) {
     item.append(caption);
     root.append(item);
   }
+}
+
+function renderTimerRois(entries) {
+  const root = document.querySelector("#timerRois");
+  if (!root) return;
+  root.innerHTML = "";
+  const filtered = (entries || []).filter((e) => e.roi);
+  if (!filtered.length) {
+    root.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px 0;">暂无计时器区域预览。</div>';
+    return;
+  }
+  for (const entry of filtered) {
+    const card = document.createElement("div");
+    card.className = "timer-roi-card";
+    const img = document.createElement("img");
+    img.alt = `${entry.kind} timer ROI`;
+    img.loading = "lazy";
+    if (entry.preview_url) {
+      img.src = `${entry.preview_url}?t=${entry.preview_mtime || 0}`;
+    }
+    card.append(img);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const channelLabel = entry.channel || entry.tvg_name || entry.kind;
+    const clockLabel = entry.clock || "-";
+    const sourceLabel = entry.source || "-";
+    const timeLabel = entry.updated_at || "-";
+    meta.innerHTML =
+      `<span>${entry.kind === "video" ? "视频" : "音频"}</span> ${escHtml(channelLabel)}<br>` +
+      `<span>计时器</span> ${escHtml(clockLabel)}<br>` +
+      `<span>来源</span> ${escHtml(sourceLabel)}<br>` +
+      `<span>更新</span> ${escHtml(timeLabel)}<br>` +
+      `<span>ROI</span> ${entry.roi.map((v) => Number(v).toFixed(3)).join(",")}`;
+    card.append(meta);
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const delPreview = document.createElement("button");
+    delPreview.className = "danger";
+    delPreview.textContent = "删除预览";
+    delPreview.addEventListener("click", async () => {
+      try {
+        await api("/api/timer-rois/delete-preview", { method: "POST", body: JSON.stringify({ key: entry.key }) });
+        await loadTimerRois();
+        showToast("预览已删除");
+      } catch (e) { showToast(e.message); }
+    });
+    actions.append(delPreview);
+    const delRoi = document.createElement("button");
+    delRoi.className = "danger";
+    delRoi.textContent = "删除 ROI";
+    delRoi.addEventListener("click", async () => {
+      if (!window.confirm("删除该频道的计时器区域？")) return;
+      try {
+        await api("/api/timer-rois/delete", { method: "POST", body: JSON.stringify({ key: entry.key }) });
+        await loadTimerRois();
+        showToast("ROI 已删除");
+      } catch (e) { showToast(e.message); }
+    });
+    actions.append(delRoi);
+    card.append(actions);
+    root.append(card);
+  }
+}
+
+function escHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str || "";
+  return div.innerHTML;
+}
+
+async function loadTimerRois() {
+  const data = await api("/api/timer-rois");
+  renderTimerRois(data.entries || []);
 }
 
 async function loadChannels(kind, { force = true, quiet = false, serverFilter = true } = {}) {

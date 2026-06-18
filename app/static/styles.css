@@ -270,6 +270,47 @@ pre {
   font-size: 12px;
 }
 
+#timerRois {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.timer-roi-card {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font-size: 12px;
+}
+.timer-roi-card img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: #111;
+  border-radius: 4px;
+}
+.timer-roi-card .meta {
+  display: grid;
+  gap: 2px;
+  color: var(--text);
+  line-height: 1.4;
+}
+.timer-roi-card .meta span {
+  color: var(--muted);
+  font-weight: 600;
+}
+.timer-roi-card .actions {
+  display: flex;
+  gap: 6px;
+}
+.timer-roi-card .actions button {
+  min-height: 32px;
+  font-size: 12px;
+  padding: 0 10px;
+}
+#timerRois { max-height: none; }
 #toast {
   position: fixed;
   right: 16px;

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import contextlib
 import math
@@ -52,6 +53,7 @@ OFFSET_STATE = Path(os.environ.get("OFFSET_STATE", str(STATE_DIR / "last_sync_of
 PROFILE_PATH = STATE_DIR / "profile.json"
 ROI_PATH = STATE_DIR / "roi.json"
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
+ROI_PREVIEW_DIR = STATE_DIR / "roi_previews"
 CLOCK_RE = re.compile(r"(?<!\d)([0-9]{1,3})[:：.]([0-9]{2})(?!\d)")
 STOPPAGE_RE = re.compile(r"(?<!\d)([0-9]{1,3})(?::00)?\+([0-9]{1,2})(?:[:：.]([0-9]{2})(?!\d)|(?![:：.\d]))")
 STOPPAGE_BASE_RE = re.compile(r"(?<!\d)([0-9]{1,3})(?:[:：.]([0-9]{2}))?(?!\d)")
@@ -66,6 +68,9 @@ DEFAULT_VIDEO_TIMER_ROI_PRESETS = "\n".join([
     "0.111,0.000,0.077,0.185",
 ])
 DEFAULT_AUDIO_TIMER_ROI_PRESETS = "0.824,0.080,0.078,0.140"
+TIMER_ROI_SCAN_INTERVAL_SECONDS = 30
+TIMER_ROI_SCAN_WINDOW_SECONDS = 300
+TIMER_ROI_PREVIEW_MULTIPLIER = 3.0
 
 
 def env(name, default=""):
@@ -354,6 +359,12 @@ def coerce_text(value, default=""):
     return value if value else str(default)
 
 
+def normalize_key_text(value):
+    text = normalize(value)
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")
+
+
 def parse_roi(value):
     parts = [float(x.strip()) for x in str(value or "").split(",")]
     if len(parts) != 4:
@@ -545,6 +556,12 @@ class AlignmentMonitor:
     mismatch_offsets: list = field(default_factory=list)
     mismatch_count: int = 0
     checks: int = 0
+    video_missing_count: int = 0
+    audio_missing_count: int = 0
+    video_next_probe_at: float = 0.0
+    audio_next_probe_at: float = 0.0
+    video_search_started_at: float = 0.0
+    audio_search_started_at: float = 0.0
 
     def locked(self):
         return self.video_roi is not None and self.audio_roi is not None
@@ -1737,6 +1754,153 @@ class LiveManager:
             return None
         return ClockSample(0.0, parsed[0], parsed[1], roi)
 
+    def _roi_store(self):
+        data = self.roi if isinstance(self.roi, dict) else {}
+        if "channels" not in data or not isinstance(data.get("channels"), dict):
+            data = {
+                "version": 2,
+                "channels": {},
+                "legacy": data,
+            }
+            self.roi = data
+        data.setdefault("version", 2)
+        data.setdefault("channels", {})
+        return data
+
+    def _save_roi_store(self):
+        with self.lock:
+            data = self._roi_store()
+            snapshot = json.loads(json.dumps(data))
+        json_save(ROI_PATH, snapshot)
+
+    def _channel_roi_key(self, kind, channel):
+        channel = channel or Channel(name=kind, url="")
+        basis = "|".join([
+            kind,
+            channel.tvg_id or "",
+            channel.tvg_name or "",
+            channel.name or "",
+            channel.group or "",
+        ]).strip("|")
+        readable = normalize_key_text(channel.tvg_id or channel.tvg_name or channel.name or kind) or kind
+        digest_basis = basis or f"{kind}|{channel.url or ''}"
+        digest = hashlib.sha1(digest_basis.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"{kind}:{readable}:{digest}"
+
+    def _channel_roi_entry(self, kind, channel):
+        key = self._channel_roi_key(kind, channel)
+        with self.lock:
+            entry = dict(self._roi_store().get("channels", {}).get(key) or {})
+        roi = entry.get("roi")
+        try:
+            parsed_roi = parse_roi(",".join(str(part) for part in roi)) if isinstance(roi, (list, tuple)) else parse_roi(roi)
+        except (TypeError, ValueError):
+            return key, None
+        entry["roi"] = parsed_roi
+        return key, entry
+
+    def _timer_preview_roi(self, roi):
+        x, y, w, h = roi
+        cx = x + w / 2
+        cy = y + h / 2
+        pw = min(1.0, w * TIMER_ROI_PREVIEW_MULTIPLIER)
+        ph = min(1.0, h * TIMER_ROI_PREVIEW_MULTIPLIER)
+        px = min(max(0.0, cx - pw / 2), max(0.0, 1.0 - pw))
+        py = min(max(0.0, cy - ph / 2), max(0.0, 1.0 - ph))
+        return px, py, pw, ph
+
+    def _save_timer_roi_preview(self, frame_path, kind, key, roi):
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        ROI_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        crop = self._roi_crop(frame_path, self._timer_preview_roi(roi))
+        if crop is None:
+            return ""
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)[:96]
+        out = ROI_PREVIEW_DIR / f"{safe_key}.jpg"
+        tmp = ROI_PREVIEW_DIR / f".{safe_key}.tmp.jpg"
+        cv2.imwrite(str(tmp), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        os.replace(tmp, out)
+        return out.name
+
+    def _save_channel_roi(self, kind, channel, sample, source, frame_path=None, key=None):
+        if not sample or not sample.roi:
+            return None
+        if key is None:
+            key = self._channel_roi_key(kind, channel)
+        preview = ""
+        if frame_path is not None:
+            preview = self._save_timer_roi_preview(frame_path, kind, key, sample.roi)
+        entry = {
+            "key": key,
+            "kind": kind,
+            "channel": channel.name if channel else kind,
+            "tvg_id": channel.tvg_id if channel else "",
+            "tvg_name": channel.tvg_name if channel else "",
+            "group": channel.group if channel else "",
+            "roi": [round(float(part), 6) for part in sample.roi],
+            "source": source,
+            "clock": sample.text,
+            "preview": preview,
+            "updated_at": now(),
+            "updated_at_unix": int(time.time()),
+        }
+        with self.lock:
+            store = self._roi_store()
+            old = store["channels"].get(key) or {}
+            if not preview and old.get("preview"):
+                entry["preview"] = old.get("preview", "")
+            store["channels"][key] = entry
+            snapshot = json.loads(json.dumps(store))
+        json_save(ROI_PATH, snapshot)
+        return entry
+
+    def _timer_roi_entries(self):
+        with self.lock:
+            channels = dict(self._roi_store().get("channels", {}))
+        entries = []
+        for key, raw in channels.items():
+            if not isinstance(raw, dict):
+                continue
+            entry = dict(raw)
+            entry["key"] = key
+            preview = str(entry.get("preview") or "")
+            if preview:
+                path = ROI_PREVIEW_DIR / preview
+                entry["preview_url"] = f"/roi-previews/{preview}" if path.exists() else ""
+                try:
+                    entry["preview_mtime"] = path.stat().st_mtime if path.exists() else 0
+                except FileNotFoundError:
+                    entry["preview_mtime"] = 0
+            else:
+                entry["preview_url"] = ""
+                entry["preview_mtime"] = 0
+            entries.append(entry)
+        entries.sort(key=lambda item: (item.get("kind") != "video", item.get("channel", ""), item.get("key", "")))
+        return entries
+
+    def delete_timer_roi(self, key, *, roi=True, preview=True):
+        key = str(key or "").strip()
+        if not key:
+            raise RuntimeError("missing ROI key")
+        removed = {}
+        with self.lock:
+            store = self._roi_store()
+            entry = store["channels"].get(key)
+            if not entry:
+                return {"ok": True, "key": key, "removed": False}
+            removed = dict(entry)
+            if preview and entry.get("preview"):
+                removed["preview"] = entry.get("preview")
+                entry["preview"] = ""
+            if roi:
+                removed = dict(store["channels"].pop(key))
+            snapshot = json.loads(json.dumps(store))
+        if preview and removed.get("preview"):
+            (ROI_PREVIEW_DIR / removed["preview"]).unlink(missing_ok=True)
+        json_save(ROI_PATH, snapshot)
+        self.log(f"timer ROI {'deleted' if roi else 'preview deleted'}: {key}")
+        return {"ok": True, "key": key, "removed": True}
+
     def _preset_rois_for_kind(self, profile, kind):
         key = "audio_roi_presets" if kind == "audio" else "video_roi_presets"
         rois = parse_roi_list(profile.get(key, ""))
@@ -1765,6 +1929,61 @@ class LiveManager:
         sample = self._find_frame_clock(frame_path)
         if sample:
             return sample, "auto"
+        return None, ""
+
+    def _resolve_monitor_roi_for_frame(self, frame_path, kind, profile, monitor, channel_name):
+        ch_key = monitor.video_channel_key if kind == "video" else monitor.audio_channel_key
+        # 1. Channel cache ROI
+        if ch_key:
+            with self.lock:
+                entry = dict(self._roi_store().get("channels", {}).get(ch_key) or {})
+            if entry and entry.get("roi"):
+                try:
+                    raw = entry["roi"]
+                    if isinstance(raw, (list, tuple)):
+                        roi = parse_roi(",".join(str(p) for p in raw))
+                    else:
+                        roi = parse_roi(str(raw))
+                    return ClockSample(0.0, 0, entry.get("clock", ""), roi), "cache"
+                except (TypeError, ValueError):
+                    pass
+        # 2. Profile manual ROI (legacy override)
+        roi_key = "audio_roi" if kind == "audio" else "video_roi"
+        try:
+            manual_roi = parse_roi(profile.get(roi_key, DEFAULT_PROFILE[roi_key]))
+            sample = self._read_locked_clock(frame_path, manual_roi)
+            if sample:
+                return sample, "manual"
+        except (TypeError, ValueError):
+            pass
+        # 3. Preset ROIs
+        sample = self._read_preset_clock(frame_path, profile, kind)
+        if sample:
+            chan = Channel(name=channel_name)
+            self._save_channel_roi(kind, chan, sample, "preset", frame_path=frame_path, key=ch_key)
+            return sample, "preset"
+        # 4. Full scan / rate-limited probe
+        now = time.time()
+        probe_at = monitor.video_next_probe_at if kind == "video" else monitor.audio_next_probe_at
+        search_started = monitor.video_search_started_at if kind == "video" else monitor.audio_search_started_at
+        if probe_at > 0 and now < probe_at:
+            return None, ""
+        if search_started > 0 and now - search_started > TIMER_ROI_SCAN_WINDOW_SECONDS:
+            return None, ""
+        if search_started <= 0:
+            if kind == "video":
+                monitor.video_search_started_at = now
+            else:
+                monitor.audio_search_started_at = now
+        sample = self._find_frame_clock(frame_path)
+        if kind == "video":
+            monitor.video_next_probe_at = now + TIMER_ROI_SCAN_INTERVAL_SECONDS
+        else:
+            monitor.audio_next_probe_at = now + TIMER_ROI_SCAN_INTERVAL_SECONDS
+        if sample:
+            chan = Channel(name=channel_name)
+            self._save_channel_roi(kind, chan, sample, "scan", frame_path=frame_path, key=ch_key)
+            return sample, "scan"
         return None, ""
 
     def _lock_monitor_roi(self, monitor, kind, sample, profile, source):
@@ -1799,72 +2018,81 @@ class LiveManager:
         threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
         required_mismatches = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=1)
         current = float(profile.get("offset_seconds", 0) or 0)
-
         monitor.checks += 1
+
+        # Resolve video ROI from channel cache / presets / scan
         if not monitor.video_roi:
-            sample, source = self._find_clock_with_presets(video_frame, profile, "video")
+            sample, source = self._resolve_monitor_roi_for_frame(video_frame, "video", profile, monitor, monitor.video_channel)
             if sample:
                 self._lock_monitor_roi(monitor, "video", sample, profile, source)
+
+        # Resolve audio ROI
         if not monitor.audio_roi:
-            sample, source = self._find_clock_with_presets(audio_frame, profile, "audio")
+            sample, source = self._resolve_monitor_roi_for_frame(audio_frame, "audio", profile, monitor, monitor.audio_channel)
             if sample:
                 self._lock_monitor_roi(monitor, "audio", sample, profile, source)
 
+        # Not fully locked yet
         if not monitor.locked():
             monitor.state = "acquiring"
             missing = []
+            now_t = time.time()
             if not monitor.video_roi:
-                missing.append("video")
+                detail = ""
+                if monitor.video_search_started_at:
+                    remain = max(0, TIMER_ROI_SCAN_WINDOW_SECONDS - (now_t - monitor.video_search_started_at))
+                    if remain > 0:
+                        detail = f" (scan {int(remain)}s)"
+                missing.append("video" + detail)
             if not monitor.audio_roi:
-                missing.append("audio")
-            monitor.message = "waiting for timer ROI: " + ",".join(missing)
+                detail = ""
+                if monitor.audio_search_started_at:
+                    remain = max(0, TIMER_ROI_SCAN_WINDOW_SECONDS - (now_t - monitor.audio_search_started_at))
+                    if remain > 0:
+                        detail = f" (scan {int(remain)}s)"
+                missing.append("audio" + detail)
+            monitor.message = "waiting for timer ROI: " + ", ".join(missing)
             return None, monitor.message
 
         video_sample = self._read_locked_clock(video_frame, monitor.video_roi)
         audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi)
+
         if video_sample and not monitor.video_roi_locked:
             monitor.video_roi_locked = True
             monitor.video_clock = video_sample.text
-            self.log(f"auto-align: locked video ROI from configured {self._format_roi_value(video_sample.roi)} ({video_sample.text})")
+            self.log(f"auto-align: locked video ROI {self._format_roi_value(video_sample.roi)} ({video_sample.text})")
         if audio_sample and not monitor.audio_roi_locked:
             monitor.audio_roi_locked = True
             monitor.audio_clock = audio_sample.text
-            self.log(f"auto-align: locked audio ROI from configured {self._format_roi_value(audio_sample.roi)} ({audio_sample.text})")
-        if not video_sample and not monitor.video_roi_locked:
-            monitor.video_roi = None
-        if not audio_sample and not monitor.audio_roi_locked:
-            monitor.audio_roi = None
-        if not monitor.video_roi:
-            sample, source = self._find_clock_with_presets(video_frame, profile, "video")
-            if sample:
-                video_sample = sample
-                self._lock_monitor_roi(monitor, "video", sample, profile, source)
-        if not monitor.audio_roi:
-            sample, source = self._find_clock_with_presets(audio_frame, profile, "audio")
-            if sample:
-                audio_sample = sample
-                self._lock_monitor_roi(monitor, "audio", sample, profile, source)
-        if not monitor.locked():
-            monitor.state = "acquiring"
-            monitor.message = "configured ROI unreadable; searching timer ROI"
-            return None, monitor.message
+            self.log(f"auto-align: locked audio ROI {self._format_roi_value(audio_sample.roi)} ({audio_sample.text})")
+
+        # Timer temporarily missing in locked ROI (halftime etc.)
         if not video_sample or not audio_sample:
-            monitor.state = "locked"
-            monitor.message = (
-                "timer missing in locked ROI; pausing alignment check "
-                f"({monitor.mismatch_count}/{required_mismatches})"
-            )
+            if not video_sample:
+                monitor.video_missing_count += 1
+            if not audio_sample:
+                monitor.audio_missing_count += 1
+            total_missing = max(monitor.video_missing_count, monitor.audio_missing_count)
+            if total_missing >= 3:
+                monitor.state = "locked"
+                monitor.message = f"timer missing for {total_missing} checks; waiting"
+            else:
+                monitor.state = "locked"
+                monitor.message = f"timer missing ({total_missing}/3)"
             return None, monitor.message
+
+        # Both clocks readable - reset missing counters
+        if video_sample:
+            monitor.video_missing_count = 0
+        if audio_sample:
+            monitor.audio_missing_count = 0
 
         monitor.video_clock = video_sample.text
         monitor.audio_clock = audio_sample.text
         candidate, detail = self._candidate_offset_from_samples(video_sample, audio_sample, profile)
         if candidate is None:
             monitor.state = "locked"
-            monitor.message = (
-                detail + "; pausing alignment check "
-                f"({monitor.mismatch_count}/{required_mismatches})"
-            )
+            monitor.message = detail + f" ({monitor.mismatch_count}/{required_mismatches})"
             return None, monitor.message
 
         delta = abs(candidate - current)
@@ -1957,6 +2185,10 @@ class LiveManager:
         freeze_after_aligned = parse_bool(auto_align_profile.get("auto_align_stop_after_aligned", DEFAULT_PROFILE.get("auto_align_stop_after_aligned", False)))
         alignment_frozen = False
         align_monitor = AlignmentMonitor()
+        align_monitor.video_channel = video.name if video else ""
+        align_monitor.audio_channel = audio.name if audio and audio.url else ""
+        align_monitor.video_channel_key = self._channel_roi_key("video", video)
+        align_monitor.audio_channel_key = self._channel_roi_key("audio", audio) if audio and audio.url else ""
         try:
             align_monitor.video_roi = parse_roi(auto_align_profile.get("video_roi", DEFAULT_PROFILE["video_roi"]))
             align_monitor.audio_roi = parse_roi(auto_align_profile.get("audio_roi", DEFAULT_PROFILE["audio_roi"]))
@@ -3277,6 +3509,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(MANAGER.get_public_profile())
         if path == "/api/logs":
             return self.send_json({"lines": list(MANAGER.logs)})
+        if path == "/api/timer-rois":
+            return self.send_json({"entries": MANAGER._timer_roi_entries()})
         if path == "/api/roi":
             return self.send_json(MANAGER.roi)
         if path == "/api/snapshots":
@@ -3303,6 +3537,11 @@ class Handler(SimpleHTTPRequestHandler):
             if not target.exists() and path == "/index.m3u8":
                 return self.send_text("HLS playlist is not ready\n", "text/plain; charset=utf-8", status=HTTPStatus.SERVICE_UNAVAILABLE, extra_headers={"Retry-After": "2"})
             return self.send_file(target)
+        if path.startswith("/roi-previews/"):
+            try:
+                return self.send_file(safe_child_path(ROI_PREVIEW_DIR, path.removeprefix("/roi-previews/")))
+            except PermissionError:
+                return self.send_error(HTTPStatus.NOT_FOUND)
         if path.startswith("/snapshots/"):
             try:
                 return self.send_file(safe_child_path(SNAPSHOT_DIR, path.removeprefix("/snapshots/")))
@@ -3341,6 +3580,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(MANAGER.refresh_schedule(force=True))
             if path == "/api/clear":
                 return self.send_json(MANAGER.clear_runtime(data.get("target", "")))
+            if path == "/api/timer-rois/delete":
+                return self.send_json(MANAGER.delete_timer_roi(data.get("key", ""), roi=data.get("roi", True), preview=data.get("preview", True)))
+            if path == "/api/timer-rois/delete-preview":
+                return self.send_json(MANAGER.delete_timer_roi(data.get("key", ""), roi=False, preview=True))
             if path == "/api/roi":
                 MANAGER.roi = data
                 json_save(ROI_PATH, data)
