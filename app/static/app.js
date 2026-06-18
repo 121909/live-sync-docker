@@ -17,22 +17,19 @@ const profileFields = [
   "segment_time",
   "playlist_size",
   "channel_name",
+  "recording_label",
   "ocr_provider",
+  "ocrspace_api_key",
   "ocr_api_key",
+  "ocr_custom_endpoint",
+  "ocr_custom_model",
   "local_cache_enabled",
   "local_cache_seconds",
-  "auto_align_enabled",
-  "auto_align_stop_after_aligned",
   "auto_align_interval",
   "auto_align_samples",
   "auto_align_threshold",
   "auto_align_max_offset",
-  "video_roi",
-  "audio_roi",
-  "video_roi_presets",
-  "audio_roi_presets",
   "schedule_enabled",
-  "auto_align_outside_match",
   "schedule_pre_minutes",
   "schedule_duration_minutes",
   "schedule_post_minutes",
@@ -45,6 +42,8 @@ const stageLabels = {
   stopped: "已停止",
   starting: "启动中",
   running: "运行中",
+  stopping: "停止中",
+  error: "错误",
   acquiring: "寻找计时器",
   locked: "已锁定",
   aligned: "已对齐",
@@ -111,7 +110,7 @@ function profileFromForm() {
       profile[name] = Number.parseInt(el.value || "0", 10);
     } else if (el.type === "checkbox") {
       profile[name] = el.checked;
-    } else if (["video_playlist", "audio_playlist", "video_headers", "audio_headers", "video_roi_presets", "audio_roi_presets"].includes(name)) {
+    } else if (["video_playlist", "audio_playlist", "video_headers", "audio_headers"].includes(name)) {
       profile[name] = el.value
         .split("\n")
         .map((item) => item.trim())
@@ -162,6 +161,20 @@ function zhStatus(value) {
   return stageLabels[value] || value || "-";
 }
 
+function updateRecordingStatus(recording) {
+  const root = document.querySelector("#recordingStatus");
+  if (!root) return;
+  const active = recording?.running ? recording?.active : null;
+  if (!active) {
+    root.textContent = "未开始";
+    return;
+  }
+  const state = zhStatus(active.status);
+  const merge = active.merge_status ? ` / ${active.merge_status}` : "";
+  const segs = active.segment_count != null ? ` / ${active.segment_count} 段` : "";
+  root.textContent = `${active.label || active.session_id} · ${state}${merge}${segs}`;
+}
+
 function updateStatus(status) {
   if (!loadedOnce) {
     fillForm(status.profile || {});
@@ -202,6 +215,7 @@ function updateStatus(status) {
   document.querySelector("#lastAlignTime").textContent = status.last_alignment || "-";
   document.querySelector("#alignMsg").textContent = status.auto_align_msg || "-";
   document.querySelector("#lastSnapshotTime").textContent = status.last_snapshot_at || "-";
+  renderOcrResults(status);
   const schedule = status.schedule || {};
   const scheduleEl = document.querySelector("#scheduleStatus");
   scheduleEl.textContent = schedule.enabled ? (schedule.active ? "比赛窗口" : "等待比赛") : "关闭";
@@ -219,27 +233,28 @@ function updateStatus(status) {
   document.querySelector("#hlsUrl").value = `${window.location.origin}${status.hls_url || "/index.m3u8"}`;
   document.querySelector("#hlsLink").href = status.hls_url || "/index.m3u8";
   document.querySelector("#embyLink").href = status.emby_url || "/emby.m3u";
+  updateRecordingStatus(status.recording || {});
 }
 
 async function refresh() {
-  const [status, logs, snapshots] = await Promise.all([
+  const [status, logs] = await Promise.all([
     api("/api/status"),
     api("/api/logs"),
-    api("/api/snapshots"),
   ]);
   updateStatus(status);
   document.querySelector("#logOutput").textContent = (logs.lines || []).join("\n") || "暂无日志。";
-  renderSnapshots(snapshots.snapshots || []);
   loadTimerRois().catch(() => {});
   autoLoadChannelsOnce().catch(() => {});
+  loadRecordings().catch(() => {});
 }
 
 async function runAction(label, fn) {
   setBusy(true);
   try {
-    await fn();
+    const result = await fn();
     await refresh();
     showToast(label);
+    return result;
   } catch (error) {
     showToast(error.message);
   } finally {
@@ -247,29 +262,27 @@ async function runAction(label, fn) {
   }
 }
 
-function renderSnapshots(snapshots) {
-  const root = document.querySelector("#snapshots");
-  root.innerHTML = "";
-  const byKind = Object.fromEntries((snapshots || []).map((shot) => [shot.kind || "", shot]));
+function renderOcrResults(status) {
+  const ocr = status.last_ocr_results || {};
+  const monitor = status.auto_align_monitor || {};
   for (const kind of ["video", "audio"]) {
-    const shot = byKind[kind] || { kind, name: `${kind}_snapshot.jpg`, url: "", mtime: 0 };
-    const item = document.createElement(shot.url ? "a" : "div");
-    item.className = "snapshot-slot";
-    if (shot.url) {
-      item.href = shot.url;
-      item.target = "_blank";
+    const clockEl = document.querySelector(`#${kind}OcrClock`);
+    const timeEl = document.querySelector(`#${kind}OcrTime`);
+    if (!clockEl) continue;
+    const data = ocr[kind];
+    if (data && data.clock) {
+      clockEl.textContent = data.clock;
+      timeEl.textContent = data.updated_at ? `更新于 ${data.updated_at}` : "";
+    } else {
+      const monitorClock = kind === "video" ? monitor.video_clock : monitor.audio_clock;
+      if (monitorClock) {
+        clockEl.textContent = monitorClock;
+        timeEl.textContent = "监控中";
+      } else {
+        clockEl.textContent = "-";
+        timeEl.textContent = "等待 OCR 识别";
+      }
     }
-    const image = document.createElement("img");
-    image.alt = `${kind} snapshot`;
-    image.loading = "lazy";
-    if (shot.url) {
-      image.src = `${shot.url}?t=${shot.mtime}`;
-    }
-    const caption = document.createElement("span");
-    caption.textContent = shot.url ? `${kind === "video" ? "视频" : "音频"}截图` : `${kind === "video" ? "视频" : "音频"}截图待生成`;
-    item.append(image);
-    item.append(caption);
-    root.append(item);
   }
 }
 
@@ -339,6 +352,74 @@ function escHtml(str) {
   const div = document.createElement("div");
   div.textContent = str || "";
   return div.innerHTML;
+}
+
+function renderRecordings(items) {
+  const root = document.querySelector("#recordingList");
+  if (!root) return;
+  root.innerHTML = "";
+  if (!items.length) {
+    root.textContent = "暂无录制。";
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "recording-row";
+    const meta = document.createElement("div");
+    meta.className = "recording-meta";
+    const title = document.createElement("strong");
+    title.textContent = item.label || item.session_id || "-";
+    const sub = document.createElement("span");
+    sub.textContent = `${item.status || "-"} / ${item.merge_status || "-"} / ${item.segment_count ?? 0} 段`;
+    meta.append(title, sub);
+    const actions = document.createElement("div");
+    actions.className = "recording-actions";
+
+    const playlist = document.createElement("a");
+    playlist.className = "link-button";
+    playlist.href = item.playlist_url || "#";
+    playlist.target = "_blank";
+    playlist.textContent = "播放列表";
+    actions.append(playlist);
+
+    if (item.merged_url) {
+      const merged = document.createElement("a");
+      merged.className = "link-button";
+      merged.href = item.merged_url;
+      merged.target = "_blank";
+      merged.textContent = "单文件";
+      actions.append(merged);
+    }
+
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "secondary";
+    exportBtn.textContent = "合并导出";
+    exportBtn.addEventListener("click", async () => {
+      try {
+        await api("/api/recording/merge", {
+          method: "POST",
+          body: JSON.stringify({
+            session_id: item.session_id,
+            output_format: document.querySelector("#recordingExportFormat").value,
+          }),
+        });
+        await loadRecordings();
+        showToast("录制已合并");
+      } catch (e) {
+        showToast(e.message);
+      }
+    });
+    actions.append(exportBtn);
+
+    row.append(meta, actions);
+    root.append(row);
+  });
+}
+
+async function loadRecordings() {
+  const data = await api("/api/recordings");
+  renderRecordings(data.recordings || []);
 }
 
 async function loadTimerRois() {
@@ -468,6 +549,36 @@ document.querySelector("#refreshSchedule").addEventListener("click", () => {
   runAction("赛程已刷新", () => api("/api/schedule/refresh", { method: "POST", body: "{}" }));
 });
 
+document.querySelector("#startRecording").addEventListener("click", () => {
+  runAction("录制已开始", () =>
+    api("/api/recording/start", {
+      method: "POST",
+      body: JSON.stringify({
+        label: form.elements.recording_label?.value || "",
+      }),
+    })
+  );
+});
+
+document.querySelector("#stopRecording").addEventListener("click", () => {
+  runAction("录制已停止", () => api("/api/recording/stop", { method: "POST", body: "{}" }));
+});
+
+document.querySelector("#refreshRecordings").addEventListener("click", () => {
+  runAction("录制列表已刷新", loadRecordings);
+});
+
+document.querySelector("#testOcr").addEventListener("click", () => {
+  runAction("OCR 测试完成", () =>
+    api("/api/ocr/test", { method: "POST", body: JSON.stringify(profileFromForm()) }).then((result) => {
+      if (!result.ok) {
+        throw new Error(result.message || "OCR 测试失败");
+      }
+      return result;
+    })
+  );
+});
+
 document.querySelector("#copyHls").addEventListener("click", async () => {
   await navigator.clipboard.writeText(document.querySelector("#hlsUrl").value);
   showToast("HLS 地址已复制");
@@ -536,6 +647,22 @@ document.querySelector("#clearState").addEventListener("click", () => {
     api("/api/clear", { method: "POST", body: JSON.stringify({ target: "state" }) })
   );
 });
+
+function toggleCustomOcrFields() {
+  const provider = document.querySelector('[name="ocr_provider"]');
+  const isCustom = provider && provider.value === "custom";
+  document.querySelectorAll(".custom-ocr-field").forEach((el) => {
+    el.style.display = isCustom ? "" : "none";
+  });
+}
+
+document.querySelector('[name="ocr_provider"]')?.addEventListener("change", toggleCustomOcrFields);
+// Also trigger on form fill
+const _origFillForm = fillForm;
+fillForm = function(profile) {
+  _origFillForm(profile);
+  toggleCustomOcrFields();
+};
 
 refresh().catch((error) => showToast(error.message));
 setInterval(() => {

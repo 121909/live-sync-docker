@@ -37,7 +37,7 @@ def configure_environment():
 
 def dependency_status():
     missing = []
-    for command in ("ffmpeg", "tesseract"):
+    for command in ("ffmpeg",):
         if shutil.which(command) is None:
             missing.append(command)
     return missing
@@ -56,7 +56,7 @@ def main():
     missing = dependency_status()
     if missing:
         print("缺少运行依赖：" + ", ".join(missing), file=sys.stderr)
-        print("请把 ffmpeg 和 tesseract 放到软件目录的 bin 文件夹，或安装到系统 PATH。", file=sys.stderr)
+        print("请把 ffmpeg 放到软件目录的 bin 文件夹，或安装到系统 PATH。", file=sys.stderr)
         input("按回车退出...")
         return 2
 

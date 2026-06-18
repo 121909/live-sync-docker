@@ -40,7 +40,7 @@ if [[ -z "$SYNC_OFFSET" ]]; then
     echo "using default sync offset: ${SYNC_OFFSET}s"
   else
     echo "no sync offset found." >&2
-    echo "run auto_align_merge.py once when the clock is visible, or start with SYNC_OFFSET=25." >&2
+    echo "configure a valid OCR provider in WebUI first, or start with SYNC_OFFSET=25." >&2
     exit 2
   fi
 else

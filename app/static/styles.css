@@ -1,8 +1,10 @@
 :root {
   --bg: #f6f7f9;
+  --bg2: #eef2f7;
   --surface: #ffffff;
   --line: #d7dce2;
   --text: #1d2733;
+  --fg: #1d2733;
   --muted: #647184;
   --accent: #1463ff;
   --danger: #b42318;
@@ -258,6 +260,38 @@ textarea {
   border: 1px solid var(--line);
 }
 .snapshots { max-height: none; }
+
+.ocr-results {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin-top: 12px;
+}
+.ocr-panel {
+  background: var(--bg2);
+  border-radius: 8px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  text-align: center;
+}
+.ocr-panel h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: var(--muted);
+}
+.ocr-clock {
+  font-size: 36px;
+  font-weight: 700;
+  font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  letter-spacing: 2px;
+  color: var(--fg);
+  line-height: 1.2;
+}
+.ocr-time {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 6px;
+}
 pre {
   min-height: 260px;
   max-height: 460px;
@@ -311,6 +345,77 @@ pre {
   padding: 0 10px;
 }
 #timerRois { max-height: none; }
+
+.recording-panel {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+.recording-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.compact-select {
+  min-width: 140px;
+}
+.compact-select span {
+  display: block;
+}
+.recording-status {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg2);
+  color: var(--text);
+  font-weight: 600;
+}
+.recording-list {
+  display: grid;
+  gap: 8px;
+}
+.recording-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.recording-meta {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.recording-meta strong,
+.recording-meta span {
+  overflow-wrap: anywhere;
+}
+.recording-meta span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.recording-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  text-decoration: none;
+  font: inherit;
+}
 #toast {
   position: fixed;
   right: 16px;

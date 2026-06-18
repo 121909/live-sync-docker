@@ -6,10 +6,10 @@ RUN apt-get update && \
       ca-certificates \
       curl \
       ffmpeg \
+      openssh-server \
       python3 \
       python3-opencv \
       python3-pil \
-      tesseract-ocr \
       tini && \
     rm -rf /var/lib/apt/lists/*
 
@@ -27,9 +27,12 @@ ENV OFFSET_STATE=/state/last_sync_offset.json \
     STATE_DIR=/state \
     SCRIPTS_ROOT=/app/scripts \
     PORT=18080 \
-    MODE=hls
+    MODE=hls \
+    SSHD_ENABLED=1 \
+    SSHD_USER=root \
+    SSHD_PASSWORD=live-sync
 
-EXPOSE 18080
+EXPOSE 18080 22
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python3", "/app/app/server.py"]
+CMD ["/app/scripts/docker-entrypoint.sh", "python3", "/app/app/server.py"]
