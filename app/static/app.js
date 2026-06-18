@@ -17,6 +17,8 @@ const profileFields = [
   "segment_time",
   "playlist_size",
   "channel_name",
+  "ocr_provider",
+  "ocr_api_key",
   "local_cache_enabled",
   "local_cache_seconds",
   "auto_align_enabled",

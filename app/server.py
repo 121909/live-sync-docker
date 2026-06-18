@@ -243,6 +243,8 @@ def make_default_profile():
         "schedule_post_minutes": int(env("SCHEDULE_POST_MINUTES", "20") or 20),
         "auto_align_outside_match": auto_align_outside_match,
         "align_only_during_match": not auto_align_outside_match,
+        "ocr_provider": env("OCR_PROVIDER", "tesseract").strip().lower(),
+        "ocr_api_key": env("OCR_API_KEY", "").strip(),
     }
 
 def now():
@@ -910,6 +912,8 @@ class LiveManager:
         merged["schedule_pre_minutes"] = coerce_int(merged.get("schedule_pre_minutes"), DEFAULT_PROFILE["schedule_pre_minutes"], minimum=0)
         merged["schedule_duration_minutes"] = coerce_int(merged.get("schedule_duration_minutes"), DEFAULT_PROFILE["schedule_duration_minutes"], minimum=90)
         merged["schedule_post_minutes"] = coerce_int(merged.get("schedule_post_minutes"), DEFAULT_PROFILE["schedule_post_minutes"], minimum=0)
+        merged["ocr_provider"] = coerce_text(merged.get("ocr_provider"), DEFAULT_PROFILE["ocr_provider"])
+        merged["ocr_api_key"] = coerce_text(merged.get("ocr_api_key"), DEFAULT_PROFILE["ocr_api_key"])
         if "auto_align_outside_match" in raw_profile:
             auto_align_outside_match = parse_bool(raw_profile.get("auto_align_outside_match"))
         elif "align_only_during_match" in raw_profile:
@@ -2790,6 +2794,16 @@ class LiveManager:
                 pass
 
     def _ocr_time(self, frame_path, roi, scale=6):
+        # Use a fresh profile snapshot for OCR provider config
+        profile = self.get_profile()
+        provider = coerce_text(profile.get("ocr_provider", DEFAULT_PROFILE["ocr_provider"])).strip().lower()
+        api_key = coerce_text(profile.get("ocr_api_key", DEFAULT_PROFILE["ocr_api_key"])).strip()
+        if provider == "openai" and api_key:
+            result = self._ocr_via_openai(frame_path, roi, profile)
+            if result:
+                return result
+            self.log("OCR API failed, falling back to local tesseract")
+        # Local Tesseract fallback
         img = cv2.imread(str(frame_path))
         if img is None:
             return None
@@ -2821,6 +2835,62 @@ class LiveManager:
             if not parsed:
                 return None
         return parsed.game_time, parsed.text
+
+
+    def _ocr_via_openai(self, frame_path, roi, profile):
+        """Send ROI crop to OpenAI Vision API and return parsed clock."""
+        api_key = coerce_text(profile.get("ocr_api_key", ""))
+        if not api_key:
+            return None
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        x, y, rw, rh = roi
+        crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
+        if crop.size == 0:
+            return None
+        # Encode to JPEG base64
+        import base64
+        _, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        b64 = base64.b64encode(buf).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{b64}"
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read the game timer number from this broadcast scoreboard image. Return ONLY the digits, colon and plus sign. Examples: 77:18, 45:00+02:13, 90:00. Do not add any explanation or extra text."},
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    ]
+                }
+            ],
+            "max_tokens": 20,
+            "temperature": 0,
+        }
+        import json, urllib.request
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            raw = result["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            self.log(f"OCR API failed: {exc}")
+            return None
+        if not raw:
+            return None
+        parsed = self._parse_clock_text(raw)
+        if parsed:
+            return parsed.game_time, parsed.text
+        return None
 
     def _roi_crop(self, frame_path, roi):
         img = cv2.imread(str(frame_path))

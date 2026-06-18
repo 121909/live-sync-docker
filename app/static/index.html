@@ -45,6 +45,14 @@
           <label class="field full"><span>视频计时器预设区域（每行一个 x,y,w,h）</span><textarea name="video_roi_presets" rows="4" autocomplete="off" spellcheck="false" placeholder="0.132,0.055,0.078,0.140&#10;0.333,0.058,0.080,0.140&#10;0.114,0.049,0.077,0.077&#10;0.111,0.000,0.077,0.185"></textarea></label>
           <label class="field full"><span>音频计时器预设区域（每行一个 x,y,w,h）</span><textarea name="audio_roi_presets" rows="2" autocomplete="off" spellcheck="false" placeholder="0.824,0.080,0.078,0.140"></textarea></label>
 
+
+          <details class="field full"><summary style="cursor:pointer;font-weight:600;margin-bottom:4px">OCR 识别设置</summary>
+          <label class="field full"><span>OCR 服务商</span><select name="ocr_provider">
+            <option value="tesseract">本地 Tesseract</option>
+            <option value="openai">OpenAI Vision</option>
+          </select></label>
+          <label class="field full"><span>API Key（选择 OpenAI 时填写）</span><input name="ocr_api_key" type="password" autocomplete="off" placeholder="sk-..." /></label>
+          </details>
           <label class="field full checkbox-field"><input name="schedule_enabled" type="checkbox" /> <span>按赛程自动启停</span></label>
           <label class="field full checkbox-field"><input name="auto_align_outside_match" type="checkbox" /> <span>非比赛时间直播也自动对齐</span></label>
           <label class="field"><span>提前启动（分钟）</span><input name="schedule_pre_minutes" type="number" min="0" /></label>
