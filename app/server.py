@@ -404,6 +404,10 @@ def parse_roi_list(value):
 
 
 OCR_PROVIDERS = {"ocrspace", "custom"}
+OCR_PROVIDER_LABELS = {
+    "ocrspace": "OCR.space",
+    "custom": "自定义 OCR",
+}
 
 
 def normalize_ocr_provider(value):
@@ -412,17 +416,7 @@ def normalize_ocr_provider(value):
 
 
 def ocr_provider_ready(profile):
-    provider = normalize_ocr_provider(profile.get("ocr_provider"))
-    if not provider:
-        return False
-    key_name = "ocr_api_key" if provider == "custom" else "ocrspace_api_key"
-    api_key = coerce_text(profile.get(key_name, "")).strip()
-    if not api_key:
-        return False
-    if provider == "custom":
-        endpoint = coerce_text(profile.get("ocr_custom_endpoint", "")).strip()
-        return bool(endpoint)
-    return True
+    return any(ocr_provider_ready_for(provider, profile) for provider in ocr_provider_order(profile))
 
 
 def ocr_provider_ready_for(provider, profile):
@@ -441,6 +435,21 @@ def ocr_provider_ready_for(provider, profile):
 
 def _other_provider(provider):
     return "ocrspace" if normalize_ocr_provider(provider) == "custom" else "custom"
+
+
+def ocr_provider_order(profile):
+    primary = normalize_ocr_provider(profile.get("ocr_provider"))
+    if not primary:
+        return []
+    order = [primary]
+    fallback = _other_provider(primary)
+    if fallback != primary:
+        order.append(fallback)
+    return order
+
+
+def ocr_provider_label(provider):
+    return OCR_PROVIDER_LABELS.get(normalize_ocr_provider(provider), provider or "")
 
 
 DEFAULT_PROFILE = make_default_profile()
@@ -2142,19 +2151,15 @@ class LiveManager:
     def _find_frame_clock(self, frame_path, *, full_frame=False, profile=None):
         if profile is None:
             profile = self.get_profile()
-        provider = normalize_ocr_provider(profile.get("ocr_provider"))
-        if not provider:
+        providers = ocr_provider_order(profile)
+        if not providers:
             return None
-        # Try primary provider
-        found = coerce_clock_sample(self._try_ocr_provider(provider, frame_path, profile))
-        if found:
-            return found
-        # Fallback: try the other provider
-        fallback = _other_provider(provider)
-        if ocr_provider_ready_for(fallback, profile) and fallback != provider:
-            if full_frame:
-                self.log(f"OCR primary '{provider}' failed, fallback to '{fallback}'")
-            found = coerce_clock_sample(self._try_ocr_provider(fallback, frame_path, profile))
+        for idx, provider in enumerate(providers):
+            if idx > 0 and not ocr_provider_ready_for(provider, profile):
+                continue
+            if idx > 0 and full_frame:
+                self.log(f"OCR primary '{providers[0]}' failed, fallback to '{provider}'")
+            found = coerce_clock_sample(self._try_ocr_provider(provider, frame_path, profile))
             if found:
                 return found
         return None
@@ -2928,47 +2933,29 @@ class LiveManager:
         raise RuntimeError(errors[-1] if errors else f"empty clip: {out_path}")
 
     def _parse_clock_text(self, text):
-        cleaned = re.sub(r"\s+", "", text or "")
-        cleaned = cleaned.replace("O", "0").replace("o", "0").replace("＋", "+")
-        # 1. Try ST:X:Y+Z (e.g. 4:32+8, 94:32+8)
+        normalized = self._normalize_ocr_text(text)
+        cleaned = re.sub(r"\s+", "", normalized)
+
+        parsed = self._parse_stoppage_ocr_text(normalized)
+        if parsed:
+            return parsed
+
+        # Try ST:X:Y+Z (e.g. 94:32+8). Short elapsed stoppage forms are handled above.
         m = CLOCK_WITH_ADDED_RE.search(cleaned)
         if m:
             mins, secs, added = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if secs < 60 and mins <= 150 and added <= 30:
-                return ClockParse(mins * 60 + secs + added, f"{m.group(1)}:{m.group(2)}+{added}", "stoppage")
-        # 2. Try STOPPAGE_RE (e.g. 45:00+02:30, 90:00+5)
-        m = STOPPAGE_RE.search(cleaned)
-        if m:
-            parsed = self._combine_stoppage_parts(m.group(1), "00", m.group(2), m.group(3), m.group(0))
-            if parsed:
-                return parsed
-        # 3. Try STOPPAGE_SEPARATE_RE (e.g. 4:32 mins.+8)
-        #    but first try with spaces preserved
-        cleaned2 = re.sub(r"\s+", " ", text or "").strip()
-        cleaned2 = cleaned2.replace("O", "0").replace("o", "0").replace("＋", "+")
+            if secs < 60 and mins <= 150 and mins not in ADJACENT_STOPPAGE_BASES and added <= 30:
+                return ClockParse(mins * 60 + secs, f"{m.group(1)}:{m.group(2)}+{added}", "stoppage")
+
+        # Try STOPPAGE_SEPARATE_RE (e.g. 4:32 mins.+8) with spaces preserved.
+        cleaned2 = re.sub(r"\s+", " ", normalized).strip()
         m = STOPPAGE_SEPARATE_RE.search(cleaned2)
         if m:
             mins, secs, added = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if secs < 60 and mins <= 150 and added <= 30:
-                return ClockParse(mins * 60 + secs + added, f"{m.group(1)}:{m.group(2)}+{added}", "stoppage")
-        # 4. Multi-line: try to find two clock lines and combine
-        lines = [l.strip() for l in (text or "").split(chr(10)) if l.strip()]
-        if len(lines) >= 2:
-            l1 = re.sub(r"\s+", "", lines[0])
-            l1 = l1.replace("O", "0").replace("o", "0").replace("＋", "+")
-            l2 = re.sub(r"\s+", "", lines[1])
-            l2 = l2.replace("O", "0").replace("o", "0").replace("＋", "+")
-            # l1 could be 90:00, l2 could be 4:32+8 or +08:00
-            m1 = CLOCK_RE.search(l1)
-            m2 = CLOCK_WITH_ADDED_RE.search(l2)
-            if m1 and m2:
-                mins1, secs1 = int(m1.group(1)), int(m1.group(2))
-                if secs1 < 60 and mins1 <= 150:
-                    mins2, secs2, added = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
-                    if secs2 < 60 and mins2 <= 150 and added <= 30:
-                        total = mins2 * 60 + secs2 + added
-                        return ClockParse(total, f"{m1.group(1)}:{m1.group(2)}+{m2.group(1)}:{m2.group(2)}+{added}", "stoppage")
-        # 5. Simple clock (e.g. 90:00)
+            if secs < 60 and mins <= 150 and mins not in ADJACENT_STOPPAGE_BASES and added <= 30:
+                return ClockParse(mins * 60 + secs, f"{m.group(1)}:{m.group(2)}+{added}", "stoppage")
+
+        # Simple clock (e.g. 90:00)
         if "+" in cleaned:
             return None
         m = CLOCK_RE.search(cleaned)
@@ -2981,6 +2968,68 @@ class LiveManager:
 
     def _normalize_ocr_text(self, text):
         return (text or "").strip().replace("O", "0").replace("o", "0").replace("＋", "+")
+
+    def _parse_stoppage_ocr_text(self, text):
+        normalized = self._normalize_ocr_text(text)
+        cleaned = re.sub(r"\s+", "", normalized)
+
+        m = STOPPAGE_RE.search(cleaned)
+        if m:
+            parsed = self._combine_stoppage_parts(m.group(1), "00", m.group(2), m.group(3), m.group(0))
+            if parsed:
+                return parsed
+
+        # Scoreboards often OCR as either "45:00 0:32+4" or three separate lines:
+        # "45:00", "0:32", "+4". The elapsed timer is the actual game time offset.
+        clocks = []
+        for m in CLOCK_RE.finditer(normalized):
+            mins = int(m.group(1))
+            secs = int(m.group(2))
+            if secs < 60 and mins <= 150:
+                clocks.append({"minute": mins, "second": secs, "text": m.group(0), "start": m.start(), "end": m.end()})
+        bases = [item for item in clocks if item["minute"] in ADJACENT_STOPPAGE_BASES and item["second"] <= 5]
+        elapsed_candidates = [item for item in clocks if item["minute"] <= 30 and item["second"] < 60]
+        added_matches = []
+        for m in ADDED_TIME_RE.finditer(normalized):
+            added_min = int(m.group(1))
+            added_sec = int(m.group(2) or "0")
+            if added_min <= 30 and added_sec < 60:
+                added_matches.append({"minute": added_min, "second": added_sec, "text": m.group(0), "start": m.start(), "end": m.end()})
+
+        for base in bases:
+            later_elapsed = [item for item in elapsed_candidates if item["start"] > base["end"]]
+            later_elapsed.sort(key=lambda item: item["start"])
+            for elapsed in later_elapsed:
+                later_added = [item for item in added_matches if item["start"] >= elapsed["end"]]
+                if later_added and elapsed["minute"] > later_added[0]["minute"]:
+                    continue
+                label = f"{base['text']}+{elapsed['text']}"
+                if later_added:
+                    label = f"{label}{later_added[0]['text']}"
+                return self._combine_elapsed_stoppage_parts(base["minute"], base["second"], elapsed["minute"], elapsed["second"], label)
+
+        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+        base = None
+        elapsed = None
+        added = None
+        for line in lines:
+            if base is None:
+                base = self._parse_stoppage_base_text(line)
+                if base:
+                    continue
+            if elapsed is None:
+                elapsed = self._parse_elapsed_added_time_text(line)
+                if elapsed:
+                    continue
+            if added is None:
+                added = self._parse_added_time_text(line)
+        if base and elapsed:
+            label = f"{base['text']}+{elapsed['text']}"
+            if added:
+                label = f"{label}{added['text']}"
+            return self._combine_elapsed_stoppage_parts(base["minute"], base["second"], elapsed["minute"], elapsed["second"], label)
+
+        return None
 
     def _parse_stoppage_base_text(self, text):
         cleaned = re.sub(r"\s+", "", self._normalize_ocr_text(text))
@@ -3056,6 +3105,117 @@ class LiveManager:
             return self._ocr_via_custom(frame_path, roi, profile)
         return None
 
+    def _ocrspace_candidate_rois(self, roi, profile):
+        candidates = []
+        try:
+            base = parse_roi(roi)
+        except (TypeError, ValueError):
+            base = None
+        if base:
+            candidates.append(base)
+            candidates.append(self._timer_preview_roi(base))
+            candidates.append(self._scoreboard_scan_roi("left", width=max(0.5, min(1.0, base[2] * 6)), height=max(0.25, min(1.0, base[3] * 6))))
+        candidates.extend([
+            self._scoreboard_scan_roi("left"),
+            self._scoreboard_scan_roi("center"),
+            self._scoreboard_scan_roi("right"),
+            (0.0, 0.0, 1.0, 0.5),
+            (0.0, 0.0, 1.0, 1.0),
+        ])
+        seen = set()
+        result = []
+        for item in candidates:
+            key = tuple(round(float(part), 4) for part in item)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    def _dedupe_rois(self, rois):
+        seen = set()
+        result = []
+        for item in rois:
+            try:
+                roi = parse_roi(",".join(str(part) for part in item)) if isinstance(item, (list, tuple)) else parse_roi(item)
+            except (TypeError, ValueError):
+                continue
+            key = tuple(round(float(part), 4) for part in roi)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(roi)
+        return result
+
+    def _prepare_ocrspace_crop(self, img, roi):
+        h, w = img.shape[:2]
+        x, y, rw, rh = roi
+        crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
+        if crop.size == 0:
+            return None
+        if crop.shape[1] < 960:
+            scale = max(1.0, 960.0 / max(crop.shape[1], 1))
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        if min(norm.shape[:2]) < 240:
+            norm = cv2.resize(norm, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        proc = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
+        ok, buf = cv2.imencode(".jpg", proc, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        return buf if ok else None
+
+    def _parse_ocr_text_candidates(self, raw_text):
+        parsed = self._parse_clock_text(raw_text)
+        if parsed:
+            return parsed
+        lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+        for line in lines:
+            parsed = self._parse_clock_text(line)
+            if parsed:
+                return parsed
+        return None
+
+    def _custom_ocr_prompt(self):
+        return (
+            "Read the football match timer in this image. Return ONLY the timer text exactly as shown. "
+            "If the image shows a base time and a separate stoppage elapsed timer, include both, for example 45:00 0:32+4. "
+            "If added time appears, include it in the same string, for example 90:00+02:30 or 4:32+8. "
+            "Examples: 90:00, 45:00+02:30, 45:00 0:32+4, 90:00 4:32 mins.+8. No explanation."
+        )
+
+    def _send_custom_ocr_crop(self, crop_img, endpoint, api_key, model):
+        import cv2 as _cv2, base64, json as _json, urllib.request
+        if crop_img is None or crop_img.size == 0:
+            return None
+        _, buf = _cv2.imencode(".jpg", crop_img, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
+        b64 = base64.b64encode(buf).decode("utf-8")
+        self._record_ocr_request("custom")
+        data = _json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": self._custom_ocr_prompt()},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]}
+            ],
+            "max_tokens": 50
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{endpoint}/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}", "User-Agent": "live-sync-ocr/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            self.log(f"Custom OCR API error: {exc}")
+            return None
+        choices = result.get("choices") or []
+        if not choices:
+            return None
+        return (choices[0].get("message") or {}).get("content", "").strip()
+
     def _record_ocr_request(self, provider):
         with self.lock:
             self.status["ocr_request_count"] = int(self.status.get("ocr_request_count") or 0) + 1
@@ -3070,41 +3230,60 @@ class LiveManager:
 
     def _ocr_time(self, frame_path, roi, scale=6):
         profile = self.get_profile()
-        provider = normalize_ocr_provider(profile.get("ocr_provider", DEFAULT_PROFILE["ocr_provider"]))
-        if not provider or not ocr_provider_ready(profile):
+        providers = ocr_provider_order(profile)
+        if not providers or not ocr_provider_ready_for(providers[0], profile):
             return None
-        result = self._ocr_region_with_provider(provider, frame_path, roi, profile)
-        if result:
-            return result
-        self._log_ocr_provider_failure(provider)
-        fallback = _other_provider(provider)
-        if fallback != provider and ocr_provider_ready_for(fallback, profile):
-            self.log(f"OCR primary '{provider}' failed, ROI fallback to '{fallback}'")
-            result = self._ocr_region_with_provider(fallback, frame_path, roi, profile)
+        for idx, provider in enumerate(providers):
+            if idx > 0 and not ocr_provider_ready_for(provider, profile):
+                continue
+            if idx > 0:
+                self.log(f"OCR primary '{providers[0]}' failed, ROI fallback to '{provider}'")
+            result = self._ocr_region_with_provider(provider, frame_path, roi, profile)
             if result:
                 return result
-            self._log_ocr_provider_failure(fallback)
+            self._log_ocr_provider_failure(provider)
         return None
 
 
     def _ocr_send_ocrspace_jpeg(self, jpeg_buf, api_key):
         """Send a JPEG buffer to OCR.space, return (text, left_ratio) or None."""
-        import base64, json as _json, urllib.request
+        import json as _json, urllib.request
         self._record_ocr_request("ocrspace")
-        b64 = base64.b64encode(jpeg_buf).decode("utf-8")
-        data = urllib.parse.urlencode({
-            "apikey": api_key,
-            "base64Image": f"data:image/jpeg;base64,{b64}",
-            "language": "eng",
-            "isOverlayRequired": "true",
-            "OCREngine": "2",
-            "detectOrientation": "false",
-            "scale": "false",
-        }).encode("utf-8")
+        jpeg_data = jpeg_buf.tobytes() if hasattr(jpeg_buf, "tobytes") else bytes(jpeg_buf)
+        boundary = f"----ocrspace{uuid.uuid4().hex}"
+        body = bytearray()
+        crlf = b"\r\n"
+
+        def add_field(name, value):
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+            body.extend(str(value).encode("utf-8"))
+            body.extend(crlf)
+
+        def add_file(name, filename, content_type, data):
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8"))
+            body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+            body.extend(data)
+            body.extend(crlf)
+
+        add_field("apikey", api_key)
+        add_field("language", "eng")
+        add_field("isOverlayRequired", "true")
+        add_field("OCREngine", "2")
+        add_field("detectOrientation", "false")
+        add_field("scale", "false")
+        add_file("file", "frame.jpg", "image/jpeg", jpeg_data)
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
         req = urllib.request.Request(
             "https://api.ocr.space/parse/image",
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=bytes(body),
+            headers={
+                "apikey": api_key,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json",
+                "User-Agent": "live-sync-ocr/1.0",
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
@@ -3132,84 +3311,55 @@ class LiveManager:
         return parsed_text, left_ratio
 
     def _ocr_via_ocrspace(self, frame_path, roi, profile):
-        """Send cropped region to OCR.space and return parsed clock."""
+        """Send one or more crops to OCR.space and return parsed clock."""
         api_key = coerce_text(profile.get("ocrspace_api_key", "")).strip()
         if not api_key:
             return None
         img = cv2.imread(str(frame_path))
         if img is None:
             return None
-        h, w = img.shape[:2]
-        x, y, rw, rh = roi
-        crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
-        if crop.size == 0:
-            return None
-        import cv2 as _cv2
-        _, buf = _cv2.imencode(".jpg", crop, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-        result = self._ocr_send_ocrspace_jpeg(buf, api_key)
-        if result is None:
-            return None
-        raw_text, _left_ratio = result
-        for line in raw_text.split("\n"):
-            line = line.strip()
-            if not line:
+        for candidate_roi in self._ocrspace_candidate_rois(roi, profile):
+            buf = self._prepare_ocrspace_crop(img, candidate_roi)
+            if buf is None:
                 continue
-            parsed = self._parse_clock_text(line)
+            result = self._ocr_send_ocrspace_jpeg(buf, api_key)
+            if result is None:
+                continue
+            raw_text, _left_ratio = result
+            parsed = self._parse_ocr_text_candidates(raw_text)
             if parsed:
                 return parsed.game_time, parsed.text
         return None
 
     def _find_clock_via_ocrspace(self, frame_path, profile):
-        """Smart scan: send top half, then a scoreboard-sized band based on position."""
+        """Smart scan: send top half, then fallback to wider crops when needed."""
         api_key = coerce_text(profile.get("ocrspace_api_key", "")).strip()
         if not api_key:
             return None
         img = cv2.imread(str(frame_path))
         if img is None:
             return None
-        h, w = img.shape[:2]
-        # Step 1: send top half
-        top_half = img[:h//2, :]
-        import cv2 as _cv2
-        _, buf = _cv2.imencode(".jpg", top_half, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-        result = self._ocr_send_ocrspace_jpeg(buf, api_key)
-        if result is None:
-            return None
-        raw_text, left_ratio = result
-        parsed = None
-        for line in raw_text.split("\n"):
-            line = line.strip()
-            if not line:
+        candidate_rois = [
+            (0.0, 0.0, 1.0, 0.5),
+            self._scoreboard_scan_roi("left"),
+            self._scoreboard_scan_roi("center"),
+            self._scoreboard_scan_roi("right"),
+            self._scoreboard_scan_roi("left", height=0.35),
+            self._scoreboard_scan_roi("right", height=0.35),
+            (0.0, 0.0, 1.0, 1.0),
+        ]
+        for roi in self._dedupe_rois(candidate_rois):
+            buf = self._prepare_ocrspace_crop(img, roi)
+            if buf is None:
                 continue
-            p = self._parse_clock_text(line)
-            if p:
-                parsed = p
-                break
-        if not parsed:
-            return None
-        # Step 2: keep at least the full scoreboard in view.
-        scoreboard_roi = self._scoreboard_scan_roi("left" if left_ratio is None or left_ratio < 0.5 else "right")
-        x, y, rw, rh = scoreboard_roi
-        scoreboard = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
-        if scoreboard.size == 0:
-            return parsed.game_time, parsed.text, scoreboard_roi
-        _, buf2 = _cv2.imencode(".jpg", scoreboard, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-        result2 = self._ocr_send_ocrspace_jpeg(buf2, api_key)
-        if result2 is None:
-            return parsed.game_time, parsed.text, scoreboard_roi
-        raw_text2, _ = result2
-        parsed2 = None
-        for line in raw_text2.split("\n"):
-            line = line.strip()
-            if not line:
+            result = self._ocr_send_ocrspace_jpeg(buf, api_key)
+            if result is None:
                 continue
-            p = self._parse_clock_text(line)
-            if p:
-                parsed2 = p
-                break
-        if parsed2:
-            return parsed2.game_time, parsed2.text, scoreboard_roi
-        return parsed.game_time, parsed.text, scoreboard_roi
+            raw_text, _left_ratio = result
+            parsed = self._parse_ocr_text_candidates(raw_text)
+            if parsed:
+                return parsed.game_time, parsed.text, roi
+        return None
 
     def _ocr_via_custom(self, frame_path, roi, profile):
         """Send cropped region to custom OpenAI-compatible API and return parsed clock."""
@@ -3224,51 +3374,10 @@ class LiveManager:
         h, w = img.shape[:2]
         x, y, rw, rh = roi
         crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
-        if crop.size == 0:
-            return None
-        import cv2 as _cv2, base64, json as _json, urllib.request
-        _, buf = _cv2.imencode(".jpg", crop, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-        b64 = base64.b64encode(buf).decode("utf-8")
-        self._record_ocr_request("custom")
-        prompt = (
-            "Read the match timer in this image. Return ONLY the timer text exactly as shown. "
-            "If added time appears, include it in the same string, for example 90:00+02:30 or 4:32+8. "
-            "Examples: 90:00, 45:00+02:30, 90:00 4:32 mins.+8. No explanation."
-        )
-        data = _json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}
-            ],
-            "max_tokens": 50
-        }).encode("utf-8")
-        chat_url = f"{endpoint}/chat/completions"
-        req = urllib.request.Request(
-            chat_url, data=data,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}", "User-Agent": "live-sync-ocr/1.0"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = _json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
-            self.log(f"Custom OCR API error: {exc}")
-            if hasattr(exc, "read"):
-                try:
-                    body = exc.read().decode("utf-8", errors="replace")[:500]
-                    self.log(f"Custom OCR API response: {body}")
-                except Exception:
-                    pass
-            return None
-        choices = result.get("choices") or []
-        if not choices:
-            return None
-        reply = (choices[0].get("message") or {}).get("content", "").strip()
+        reply = self._send_custom_ocr_crop(crop, endpoint, api_key, model)
         if not reply:
             return None
-        parsed = self._parse_clock_text(reply)
+        parsed = self._parse_ocr_text_candidates(reply)
         if parsed:
             return parsed.game_time, parsed.text
         return None
@@ -3277,7 +3386,7 @@ class LiveManager:
         provider = normalize_ocr_provider(profile.get("ocr_provider"))
         if not provider:
             return {"ok": False, "provider": "", "message": "OCR 服务商未配置"}
-        if not ocr_provider_ready(profile):
+        if not ocr_provider_ready_for(provider, profile):
             missing = []
             key_name = "ocr_api_key" if provider == "custom" else "ocrspace_api_key"
             if not coerce_text(profile.get(key_name, "")).strip():
@@ -3290,34 +3399,36 @@ class LiveManager:
 
         width, height = 1280, 720
         img = np.full((height, width, 3), 255, dtype=np.uint8)
-        cv2.putText(img, "90:00", (40, 90), cv2.FONT_HERSHEY_SIMPLEX, 2.1, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(img, "+02:30", (40, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.rectangle(img, (20, 18), (620, 228), (26, 26, 26), -1)
+        cv2.putText(img, "90:00", (52, 104), cv2.FONT_HERSHEY_SIMPLEX, 2.4, (255, 255, 255), 5, cv2.LINE_AA)
+        cv2.putText(img, "+02:30", (52, 188), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 4, cv2.LINE_AA)
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
             cv2.imwrite(str(tmp_path), img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             messages = []
             success = False
-            for current in [provider, _other_provider(provider)]:
-                if current != provider and not ocr_provider_ready_for(current, profile):
-                    messages.append(f"备用服务({current}) 未配置")
+            for idx, current in enumerate(ocr_provider_order(profile)):
+                label = ocr_provider_label(current)
+                if idx > 0 and not ocr_provider_ready_for(current, profile):
+                    messages.append(f"备用服务({label}) 未配置")
                     continue
                 try:
                     if current == "ocrspace":
-                        result = self._ocr_via_ocrspace(tmp_path, (0.0, 0.0, 1.0, 1.0), profile)
+                        result = self._find_clock_via_ocrspace(tmp_path, profile)
                     else:
                         result = self._ocr_via_custom(tmp_path, (0.0, 0.0, 1.0, 1.0), profile)
                 except Exception as exc:
                     result = None
-                    messages.append(f"{current} 异常: {str(exc)[:200]}")
+                    messages.append(f"{label} 异常: {str(exc)[:200]}")
                 if result:
-                    messages.append(f"{current} 识别成功: {result[1]}")
+                    messages.append(f"{label} 识别成功: {result[1]}")
                     success = True
-                    if current != provider:
-                        messages.append(f"已自动切换到 {current}")
+                    if idx > 0:
+                        messages.append(f"已使用备用服务 {label}")
                     break
                 if not result:
-                    messages.append(f"{current} 识别失败")
+                    messages.append(f"{label} 识别失败")
             return {"ok": success, "provider": provider, "message": " | ".join(messages) if messages else "OCR 测试失败"}
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -3335,45 +3446,6 @@ class LiveManager:
         if img is None:
             return None
         h, w = img.shape[:2]
-        chat_url = f"{endpoint}/chat/completions"
-        prompt = (
-            "Read the match timer in this image. Return ONLY the timer text exactly as shown. "
-            "If added time appears, include it in the same string, for example 90:00+02:30 or 4:32+8. "
-            "Examples: 90:00, 45:00+02:30, 90:00 4:32 mins.+8. No explanation."
-        )
-
-        def _send_crop(crop_img):
-            import cv2 as _cv2, base64, json as _json, urllib.request
-            if crop_img.size == 0:
-                return None
-            _, buf = _cv2.imencode(".jpg", crop_img, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-            b64 = base64.b64encode(buf).decode("utf-8")
-            self._record_ocr_request("custom")
-            data = _json.dumps({
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                    ]}
-                ],
-                "max_tokens": 50
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                chat_url, data=data,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}", "User-Agent": "live-sync-ocr/1.0"},
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = _json.loads(resp.read().decode("utf-8"))
-            except Exception as exc:
-                return None
-            choices = result.get("choices") or []
-            if not choices:
-                return None
-            reply = (choices[0].get("message") or {}).get("content", "").strip()
-            return reply
-
         def _crop_from_roi(roi):
             x, y, rw, rh = roi
             x0 = int(x * w)
@@ -3384,51 +3456,26 @@ class LiveManager:
             return crop if crop.size else None
 
         def _parse_roi(roi):
-            crop = _crop_from_roi(roi)
-            if crop is None:
-                return None
-            reply = _send_crop(crop)
+            reply = self._send_custom_ocr_crop(_crop_from_roi(roi), endpoint, api_key, model)
             if not reply:
                 return None
-            return self._parse_clock_text(reply)
+            return self._parse_ocr_text_candidates(reply)
 
-        # Step 1: send top half
-        top_half_roi = (0.0, 0.0, 1.0, 0.5)
-        reply = _send_crop(_crop_from_roi(top_half_roi))
-        if not reply:
-            return None
-        parsed = self._parse_clock_text(reply)
-        if not parsed:
-            return None
-
-        # Step 2: narrow only to a scoreboard-sized band when possible.
-        best_match = None
-        best_any = None
         candidate_rois = [
+            (0.0, 0.0, 1.0, 0.5),
             self._scoreboard_scan_roi("left"),
             self._scoreboard_scan_roi("center"),
             self._scoreboard_scan_roi("right"),
             self._scoreboard_scan_roi("left", height=0.35),
             self._scoreboard_scan_roi("right", height=0.35),
-            (0.0, 0.0, 1.0, 0.5),
+            (0.0, 0.0, 1.0, 1.0),
         ]
-        for roi in candidate_rois:
+        for roi in self._dedupe_rois(candidate_rois):
             parsed_roi = _parse_roi(roi)
-            if not parsed_roi:
-                continue
-            area = roi[2] * roi[3]
-            if abs(parsed_roi.game_time - parsed.game_time) <= 120:
-                if best_match is None or area < best_match[2]:
-                    best_match = (parsed_roi, roi, area)
-            if best_any is None or area < best_any[2]:
-                best_any = (parsed_roi, roi, area)
+            if parsed_roi:
+                return parsed_roi.game_time, parsed_roi.text, roi
 
-        chosen = best_match or best_any
-        if chosen:
-            parsed_roi, roi, _area = chosen
-            return parsed_roi.game_time, parsed_roi.text, roi
-
-        return parsed.game_time, parsed.text, top_half_roi
+        return None
 
 
     def _roi_crop(self, frame_path, roi):

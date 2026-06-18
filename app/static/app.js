@@ -648,22 +648,6 @@ document.querySelector("#clearState").addEventListener("click", () => {
   );
 });
 
-function toggleCustomOcrFields() {
-  const provider = document.querySelector('[name="ocr_provider"]');
-  const isCustom = provider && provider.value === "custom";
-  document.querySelectorAll(".custom-ocr-field").forEach((el) => {
-    el.style.display = isCustom ? "" : "none";
-  });
-}
-
-document.querySelector('[name="ocr_provider"]')?.addEventListener("change", toggleCustomOcrFields);
-// Also trigger on form fill
-const _origFillForm = fillForm;
-fillForm = function(profile) {
-  _origFillForm(profile);
-  toggleCustomOcrFields();
-};
-
 refresh().catch((error) => showToast(error.message));
 setInterval(() => {
   refresh().catch(() => {});

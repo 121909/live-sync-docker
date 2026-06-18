@@ -39,15 +39,15 @@
           <label class="field"><span>连续不一致次数</span><input name="auto_align_samples" type="number" min="1" /></label>
           <label class="field"><span>允许误差（秒）</span><input name="auto_align_threshold" type="number" step="0.1" min="0.1" /></label>
           <label class="field"><span>最大偏移（秒）</span><input name="auto_align_max_offset" type="number" step="1" min="1" /></label>
-          <label class="field full"><span>OCR 服务商</span><select name="ocr_provider">
+          <label class="field full"><span>优先 OCR 服务</span><select name="ocr_provider">
             <option value="">未配置</option>
-            <option value="ocrspace">OCR.space</option>
-            <option value="custom">自定义 (OpenAI 兼容)</option>
+            <option value="ocrspace">OCR.space 优先，自定义备用</option>
+            <option value="custom">自定义优先，OCR.space 备用</option>
           </select></label>
           <label class="field full"><span>OCR.space API Key</span><input name="ocrspace_api_key" type="password" autocomplete="off" placeholder="ocrspace-..." /></label>
-          <label class="field full custom-ocr-field"><span>自定义 OCR API Key</span><input name="ocr_api_key" type="password" autocomplete="off" placeholder="sk-..." /></label>
-          <label class="field full custom-ocr-field"><span>自定义端点 URL</span><input name="ocr_custom_endpoint" type="url" autocomplete="off" placeholder="https://api.xxx.com/v1" /></label>
-          <label class="field full custom-ocr-field"><span>模型名称</span><input name="ocr_custom_model" type="text" autocomplete="off" placeholder="gpt-4o" /></label>
+          <label class="field full"><span>自定义 OCR API Key</span><input name="ocr_api_key" type="password" autocomplete="off" placeholder="sk-..." /></label>
+          <label class="field full"><span>自定义端点 URL</span><input name="ocr_custom_endpoint" type="url" autocomplete="off" placeholder="https://api.xxx.com/v1" /></label>
+          <label class="field full"><span>模型名称</span><input name="ocr_custom_model" type="text" autocomplete="off" placeholder="gpt-4o" /></label>
           <div class="field full">
             <button id="testOcr" class="secondary" type="button">测试 OCR 服务</button>
           </div>

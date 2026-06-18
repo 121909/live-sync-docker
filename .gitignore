@@ -4,6 +4,8 @@ __pycache__/
 
 .env
 *.log
+OCR.space
+openai
 
 state/
 data/
