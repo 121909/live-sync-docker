@@ -11,6 +11,7 @@ const profileFields = [
   "audio_playlist",
   "audio_local_m3u",
   "audio_channel",
+  "audio_fallbacks",
   "offset_seconds",
   "timeout_seconds",
   "retry_limit",
@@ -29,6 +30,7 @@ const profileFields = [
   "auto_align_samples",
   "auto_align_threshold",
   "auto_align_max_offset",
+  "auto_align_debug_override",
   "schedule_enabled",
   "schedule_pre_minutes",
   "schedule_duration_minutes",
@@ -89,7 +91,7 @@ function profileFromForm() {
   for (const name of profileFields) {
     const el = form.elements[name];
     if (!el) continue;
-    if (name === "video_fallbacks") {
+    if (["video_fallbacks", "audio_fallbacks"].includes(name)) {
       profile[name] = el.value
         .split("\n")
         .map((item) => item.trim())
@@ -203,6 +205,9 @@ function updateStatus(status) {
   } else if (!aa.active_allowed) {
     alignEl.textContent = `暂停（非比赛时间）`;
     alignEl.style.color = "var(--muted)";
+  } else if (aa.debug_override) {
+    alignEl.textContent = `开启（调试覆盖，${aa.interval}s）`;
+    alignEl.style.color = "var(--ok)";
   } else {
     alignEl.textContent = `开启（${aa.interval}s）`;
     alignEl.style.color = "var(--ok)";
@@ -243,7 +248,7 @@ async function refresh() {
   ]);
   updateStatus(status);
   document.querySelector("#logOutput").textContent = (logs.lines || []).join("\n") || "暂无日志。";
-  loadTimerRois().catch(() => {});
+  loadSnapshots().catch(() => {});
   autoLoadChannelsOnce().catch(() => {});
   loadRecordings().catch(() => {});
 }
@@ -263,88 +268,84 @@ async function runAction(label, fn) {
 }
 
 function renderOcrResults(status) {
+  const root = document.querySelector("#ocrResults");
+  if (!root) return;
+  root.innerHTML = "";
   const ocr = status.last_ocr_results || {};
   const monitor = status.auto_align_monitor || {};
-  for (const kind of ["video", "audio"]) {
-    const clockEl = document.querySelector(`#${kind}OcrClock`);
-    const timeEl = document.querySelector(`#${kind}OcrTime`);
-    if (!clockEl) continue;
+  const labels = {
+    cache_video: "本地缓存视频",
+    cache_audio: "本地缓存音频",
+    video: "延迟后视频",
+    audio: "延迟后音频",
+  };
+  for (const kind of ["cache_video", "cache_audio", "video", "audio"]) {
+    const panel = document.createElement("div");
+    panel.className = "ocr-panel";
+    const title = document.createElement("h3");
+    title.textContent = labels[kind] || kind;
+    const clockEl = document.createElement("div");
+    clockEl.className = "ocr-clock";
+    const timeEl = document.createElement("div");
+    timeEl.className = "ocr-time";
     const data = ocr[kind];
+    const monitorClock = kind === "video" ? monitor.video_clock : kind === "audio" ? monitor.audio_clock : "";
     if (data && data.clock) {
       clockEl.textContent = data.clock;
       timeEl.textContent = data.updated_at ? `更新于 ${data.updated_at}` : "";
+    } else if (monitorClock) {
+      clockEl.textContent = monitorClock;
+      timeEl.textContent = "监控中";
     } else {
-      const monitorClock = kind === "video" ? monitor.video_clock : monitor.audio_clock;
-      if (monitorClock) {
-        clockEl.textContent = monitorClock;
-        timeEl.textContent = "监控中";
-      } else {
-        clockEl.textContent = "-";
-        timeEl.textContent = "等待 OCR 识别";
-      }
+      clockEl.textContent = "-";
+      timeEl.textContent = "未识别到时间";
     }
+    panel.append(title, clockEl, timeEl);
+    root.append(panel);
   }
 }
 
-function renderTimerRois(entries) {
-  const root = document.querySelector("#timerRois");
+function renderSnapshots(items) {
+  const root = document.querySelector("#snapshotGallery");
   if (!root) return;
   root.innerHTML = "";
-  const filtered = (entries || []).filter((e) => e.roi);
-  if (!filtered.length) {
-    root.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px 0;">暂无计时器区域预览。</div>';
-    return;
-  }
-  for (const entry of filtered) {
-    const card = document.createElement("div");
-    card.className = "timer-roi-card";
-    const img = document.createElement("img");
-    img.alt = `${entry.kind} timer ROI`;
-    img.loading = "lazy";
-    if (entry.preview_url) {
-      img.src = `${entry.preview_url}?t=${entry.preview_mtime || 0}`;
+  const labels = {
+    cache_video: "本地缓存视频",
+    cache_audio: "本地缓存音频",
+    video: "延迟后视频",
+    audio: "延迟后音频",
+  };
+  for (const kind of ["cache_video", "cache_audio", "video", "audio"]) {
+    const item = (items || []).find((entry) => entry.kind === kind) || {
+      kind,
+      url: "",
+      name: `${kind}_snapshot.jpg`,
+      mtime: 0,
+    };
+    const slot = document.createElement(item.url ? "a" : "div");
+    slot.className = "snapshot-slot";
+    if (item.url) {
+      slot.href = `${item.url}?t=${item.mtime || 0}`;
+      slot.target = "_blank";
     }
-    card.append(img);
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const channelLabel = entry.channel || entry.tvg_name || entry.kind;
-    const clockLabel = entry.clock || "-";
-    const sourceLabel = entry.source || "-";
-    const timeLabel = entry.updated_at || "-";
-    meta.innerHTML =
-      `<span>${entry.kind === "video" ? "视频" : "音频"}</span> ${escHtml(channelLabel)}<br>` +
-      `<span>计时器</span> ${escHtml(clockLabel)}<br>` +
-      `<span>来源</span> ${escHtml(sourceLabel)}<br>` +
-      `<span>更新</span> ${escHtml(timeLabel)}<br>` +
-      `<span>ROI</span> ${entry.roi.map((v) => Number(v).toFixed(3)).join(",")}`;
-    card.append(meta);
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    const delPreview = document.createElement("button");
-    delPreview.className = "danger";
-    delPreview.textContent = "删除预览";
-    delPreview.addEventListener("click", async () => {
-      try {
-        await api("/api/timer-rois/delete-preview", { method: "POST", body: JSON.stringify({ key: entry.key }) });
-        await loadTimerRois();
-        showToast("预览已删除");
-      } catch (e) { showToast(e.message); }
-    });
-    actions.append(delPreview);
-    const delRoi = document.createElement("button");
-    delRoi.className = "danger";
-    delRoi.textContent = "删除 ROI";
-    delRoi.addEventListener("click", async () => {
-      if (!window.confirm("删除该频道的计时器区域？")) return;
-      try {
-        await api("/api/timer-rois/delete", { method: "POST", body: JSON.stringify({ key: entry.key }) });
-        await loadTimerRois();
-        showToast("ROI 已删除");
-      } catch (e) { showToast(e.message); }
-    });
-    actions.append(delRoi);
-    card.append(actions);
-    root.append(card);
+
+    const title = document.createElement("strong");
+    title.textContent = labels[kind] || kind;
+    slot.append(title);
+
+    const img = document.createElement("img");
+    img.alt = title.textContent;
+    img.loading = "lazy";
+    if (item.url) {
+      img.src = `${item.url}?t=${item.mtime || 0}`;
+    }
+    slot.append(img);
+
+    const meta = document.createElement("span");
+    meta.textContent = item.url ? item.name : "暂无截图";
+    slot.append(meta);
+
+    root.append(slot);
   }
 }
 
@@ -422,9 +423,9 @@ async function loadRecordings() {
   renderRecordings(data.recordings || []);
 }
 
-async function loadTimerRois() {
-  const data = await api("/api/timer-rois");
-  renderTimerRois(data.entries || []);
+async function loadSnapshots() {
+  const data = await api("/api/snapshots");
+  renderSnapshots(data.snapshots || []);
 }
 
 async function loadChannels(kind, { force = true, quiet = false, serverFilter = true } = {}) {
@@ -618,16 +619,28 @@ document.querySelector("#useAudio").addEventListener("click", () => {
   if (name) form.elements.audio_channel.value = name;
 });
 
+document.querySelector("#addAudioFallback").addEventListener("click", () => {
+  const name = selectedName("audio");
+  if (!name) return;
+  const el = form.elements.audio_fallbacks;
+  const current = el.value.trim();
+  el.value = current ? `${current}\n${name}` : name;
+});
+
 function captureShot(kind) {
-  runAction(`${kind === "video" ? "视频" : "音频"}截图已生成`, () =>
-    api("/api/snapshot", { method: "POST", body: JSON.stringify({ kind }) })
-  );
+  runAction(`${kind === "video" ? "视频" : "音频"}截图已生成`, async () => {
+    const result = await api("/api/snapshot", { method: "POST", body: JSON.stringify({ kind }) });
+    await loadSnapshots();
+    return result;
+  });
 }
 
 function captureBothShots() {
-  runAction("同步截图已生成", () =>
-    api("/api/snapshots/capture", { method: "POST", body: "{}" })
-  );
+  runAction("同步截图已生成", async () => {
+    const result = await api("/api/snapshots/capture", { method: "POST", body: "{}" });
+    await loadSnapshots();
+    return result;
+  });
 }
 
 document.querySelector("#shotBoth").addEventListener("click", captureBothShots);

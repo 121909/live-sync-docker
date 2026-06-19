@@ -7,7 +7,7 @@
 - 视频源和音频源分开选择，输出只使用主视频源画面和音频源声音。
 - 支持远程 M3U 和本地粘贴 M3U，按频道名选择主视频、备用视频和音频频道。
 - 默认启用低请求本地缓存：每路上游由一个常驻 ffmpeg 连接读取，截图、OCR 和合并都读本地缓存。
-- 默认不转码，视频、音频和源缓存都使用 `copy`；需要兼容播放器时可单独把输出音频转 AAC。
+- 默认不转码，视频、音频和源缓存都使用 `copy`。
 - 自动 OCR 读取两路画面里的比赛计时器，计算并切换 offset。
 - 自动截图和自动对齐使用同一个周期：截图保存后立即用同一批帧做 OCR 检查。
 - 视频源失败后会刷新 M3U；链接变化时使用新链接，链接未变时切换备用频道。
@@ -149,7 +149,7 @@ offset = -(音频源比赛时间 - 视频源比赛时间)
 | --- | --- |
 | `初始偏移秒` | 启动时使用的 offset。正数表示延迟视频，负数表示延迟音频。 |
 | `低请求本地缓存（不转码）` | 默认开启。每路上游只由一个常驻 ffmpeg 连接读取，并用 `copy` 写成本地滚动 HLS。 |
-| `本地缓存秒数` | 默认 240 秒。实际保留时间会至少覆盖当前 offset 和少量缓冲。 |
+| `本地缓存秒数` | 默认 360 秒。实际保留时间会至少覆盖当前 offset 和少量缓冲。 |
 | `截图/检查间隔（秒）` | 自动截图周期；截图保存后会立即用同一批帧做自动对齐检查。 |
 | `连续不一致次数` | 连续多少次发现稳定偏差后才真正调整。 |
 | `允许误差（秒）` | 候选 offset 和当前 offset 差值小于该值时认为已对齐。 |
@@ -202,7 +202,7 @@ offset = -(音频源比赛时间 - 视频源比赛时间)
 | `DEFAULT_OFFSET` | `10` | 没有保存 offset 时的默认值。 |
 | `SYNC_OFFSET` | 空 | 强制指定启动 offset。 |
 | `LOCAL_CACHE_ENABLED` | `1` | 是否启用低请求本地缓存。 |
-| `LOCAL_CACHE_SECONDS` | `240` | 本地源缓存秒数。 |
+| `LOCAL_CACHE_SECONDS` | `360` | 本地源缓存秒数。 |
 | `AUTO_ALIGN_INTERVAL` | `60` | 自动截图和检查周期。 |
 | `AUTO_ALIGN_SAMPLES` | `3` | 连续确认次数。 |
 | `AUTO_ALIGN_THRESHOLD` | `1` | offset 允许误差秒数。 |
@@ -212,8 +212,8 @@ offset = -(音频源比赛时间 - 视频源比赛时间)
 | `OCRSPACE_API_KEY` | 空 | OCR.space 专用 API Key。 |
 | `OCR_CUSTOM_ENDPOINT` | 空 | 自定义 OCR 服务端点，需为 OpenAI 兼容接口。 |
 | `OCR_CUSTOM_MODEL` | `gpt-4o` | 自定义 OCR 服务使用的模型名。 |
-| `OUTPUT_AUDIO_CODEC` | `copy` | 输出音频编码。`copy` 不转码，`aac` 转 AAC。 |
-| `HLS_SEGMENT_TYPE` | `fmp4` | 输出 HLS 分片类型。普通 H264 源会自动走 MPEG-TS 兼容路径。 |
+| `OUTPUT_AUDIO_CODEC` | `copy` | 输出音频编码固定为 `copy`，不转码。 |
+| `HLS_SEGMENT_TYPE` | `auto` | 输出 HLS 分片类型。`auto` 按频道名判断：带 `4k` 使用 fMP4，否则使用 MPEG-TS。 |
 | `STRIP_DOVI_RPU` | `1` | HEVC 源是否移除 Dolby Vision RPU 附加 NAL。 |
 | `FFMPEG_USER_AGENT` | `Emby` | 默认 ffmpeg User-Agent。 |
 | `DEFAULT_REQUEST_HEADERS` | 空 | 全局默认请求头，多行 `Header: value`。 |
@@ -236,16 +236,12 @@ DEFAULT_REQUEST_HEADERS=$'User-Agent: Emby\nAccept: */*\nCache-Control: no-cache
 
 ## 输出格式和播放
 
-默认按源视频编码选择输出格式：
+默认按频道名选择输出格式：
 
-- HEVC/HDR/Dolby Vision 源使用 fMP4。
-- 普通 H264 源自动使用 MPEG-TS 兼容模式。
+- 频道名包含 `4k` 时使用 fMP4。
+- 其它频道使用 MPEG-TS。
 
-默认视频、音频和本地缓存都使用 `copy`，不主动转码。需要为了播放器兼容性把输出音频转成 AAC 时：
-
-```bash
-OUTPUT_AUDIO_CODEC=aac docker compose up -d --build
-```
+默认视频、音频和本地缓存都使用 `copy`，不主动转码。多音轨源会优先选择 AAC 音轨并直接复制。
 
 如果某个播放器或 Emby 不支持 fMP4 HLS，可以回退到 MPEG-TS：
 

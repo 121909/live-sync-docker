@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import selectors
@@ -148,7 +149,9 @@ class StreamManager:
         video_channels = selected_video_channels(profile)
         if not video_channels:
             raise ValueError("profile requires video.primary_channel or video fallback channels")
-        audio_channel = required(profile, "audio", "channel")
+        audio_channels = selected_audio_channels(profile)
+        if not audio_channels:
+            raise ValueError("profile requires audio.channel or audio fallback channels")
         video_playlist = required(profile, "video", "playlist_url")
         audio_playlist = required(profile, "audio", "playlist_url")
         settings = profile.get("settings") if isinstance(profile.get("settings"), dict) else {}
@@ -162,12 +165,24 @@ class StreamManager:
         while not self._stop_event.is_set() and channel_index < len(video_channels):
             video_channel = video_channels[channel_index]
             video_entry = self.resolver.resolve(video_playlist, video_channel)
-            audio_entry = self.resolver.resolve(audio_playlist, audio_channel)
+            audio_channel = ""
+            audio_entry = None
+            last_audio_error = None
+            for candidate_audio_channel in audio_channels:
+                try:
+                    audio_entry = self.resolver.resolve(audio_playlist, candidate_audio_channel)
+                    audio_channel = candidate_audio_channel
+                    break
+                except Exception as exc:
+                    last_audio_error = exc
+                    self._log(f"audio resolve failed for {candidate_audio_channel}: {exc}")
+            if audio_entry is None:
+                raise RuntimeError(str(last_audio_error) if last_audio_error else "no selected audio channel works")
             last_video_url = video_entry.url
             consecutive_timeouts = 0
 
             while not self._stop_event.is_set():
-                exit_code, timed_out = self._launch_once(profile, video_channel, video_entry.url, audio_entry.url, timeout_seconds)
+                exit_code, timed_out = self._launch_once(profile, video_channel, video_entry.url, audio_entry.url, timeout_seconds, audio_channel=audio_channel)
                 if self._stop_event.is_set():
                     break
                 if not timed_out and exit_code == 0:
@@ -192,8 +207,21 @@ class StreamManager:
                 self._log("timeout threshold reached; re-fetching playlists")
                 try:
                     refreshed_video = self.resolver.resolve(video_playlist, video_channel)
-                    refreshed_audio = self.resolver.resolve(audio_playlist, audio_channel)
+                    refreshed_audio = None
+                    refreshed_audio_channel = ""
+                    last_audio_error = None
+                    for candidate_audio_channel in audio_channels:
+                        try:
+                            refreshed_audio = self.resolver.resolve(audio_playlist, candidate_audio_channel)
+                            refreshed_audio_channel = candidate_audio_channel
+                            break
+                        except Exception as exc:
+                            last_audio_error = exc
+                            self._log(f"audio resolve failed for {candidate_audio_channel}: {exc}")
+                    if refreshed_audio is None:
+                        raise RuntimeError(str(last_audio_error) if last_audio_error else "no selected audio channel works")
                     audio_entry = refreshed_audio
+                    audio_channel = refreshed_audio_channel
                 except Exception as exc:
                     self._log(f"playlist refresh failed: {exc}")
                     channel_index += 1
@@ -225,15 +253,16 @@ class StreamManager:
         video_url: str,
         audio_url: str,
         timeout_seconds: float,
+        audio_channel: str,
     ) -> tuple[int | None, bool]:
         self._prepare_output_dir()
-        cmd = build_ffmpeg_hls_cmd(profile, video_url, audio_url, self.output_dir)
+        cmd = build_ffmpeg_hls_cmd(profile, video_url, audio_url, self.output_dir, video_channel=video_channel)
         with self._lock:
             self.runtime.status = "running"
             self.runtime.message = "ffmpeg running"
             self.runtime.video_channel = video_channel
             self.runtime.video_url = video_url
-            self.runtime.audio_channel = required(profile, "audio", "channel")
+            self.runtime.audio_channel = audio_channel
             self.runtime.audio_url = audio_url
             self.runtime.restart_count += 1
         self._log("starting ffmpeg: " + redact_command(cmd))
@@ -292,6 +321,7 @@ class StreamManager:
         wall_cutoff = time.time() - max(time.monotonic() - since_monotonic, 0)
         candidates = [self.output_dir / "index.m3u8"]
         candidates.extend(self.output_dir.glob("live_*.ts"))
+        candidates.extend(self.output_dir.glob("live_*.m4s"))
         for path in candidates:
             try:
                 if path.stat().st_mtime >= wall_cutoff:
@@ -336,6 +366,19 @@ def selected_video_channels(profile: dict[str, Any]) -> list[str]:
     return channels
 
 
+def selected_audio_channels(profile: dict[str, Any]) -> list[str]:
+    audio = profile.get("audio") if isinstance(profile.get("audio"), dict) else {}
+    channels: list[str] = []
+    primary = str(audio.get("channel") or "").strip()
+    if primary:
+        channels.append(primary)
+    for channel in audio.get("fallback_channels") or []:
+        text = str(channel).strip()
+        if text and text not in channels:
+            channels.append(text)
+    return channels
+
+
 def required(profile: dict[str, Any], section: str, field_name: str) -> str:
     value = profile.get(section, {}) if isinstance(profile.get(section), dict) else {}
     result = str(value.get(field_name) or "").strip()
@@ -344,12 +387,15 @@ def required(profile: dict[str, Any], section: str, field_name: str) -> str:
     return result
 
 
-def build_ffmpeg_hls_cmd(profile: dict[str, Any], video_url: str, audio_url: str, output_dir: Path) -> list[str]:
+def build_ffmpeg_hls_cmd(profile: dict[str, Any], video_url: str, audio_url: str, output_dir: Path, video_channel: str = "") -> list[str]:
     settings = profile.get("settings") if isinstance(profile.get("settings"), dict) else {}
-    segment_time = str(settings.get("segment_time", 2))
-    playlist_size = str(settings.get("playlist_size", 30))
+    segment_time = str(settings.get("segment_time", 4))
+    playlist_size = str(settings.get("playlist_size", 60))
     offset = float(profile.get("offset_seconds") or settings.get("offset_seconds") or 0)
     _list_size = max(20, math.ceil(max(offset, 0) / float(segment_time)) + 20)
+    audio_index = select_aac_audio_index(audio_url, float(settings.get("timeout_seconds", 120)))
+    segment_type = segment_type_for_channel(profile, video_channel)
+    segment_ext = ".m4s" if segment_type == "fmp4" else ".ts"
 
     cmd = [
         "ffmpeg",
@@ -364,10 +410,34 @@ def build_ffmpeg_hls_cmd(profile: dict[str, Any], video_url: str, audio_url: str
         # Existing scripts can still be used for exact delayed-video behavior.
         cmd += ["-itsoffset", f"{offset:.3f}"]
     cmd += [
+        "-rw_timeout",
+        str(int(float(settings.get("timeout_seconds", 120)) * 1_000_000)),
+        "-protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,data,pipe",
+        "-reconnect",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "10",
         "-thread_queue_size",
         "4096",
         "-i",
         video_url,
+        "-rw_timeout",
+        str(int(float(settings.get("timeout_seconds", 120)) * 1_000_000)),
+        "-protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,data,pipe",
+        "-reconnect",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "10",
         "-thread_queue_size",
         "4096",
         "-i",
@@ -375,7 +445,7 @@ def build_ffmpeg_hls_cmd(profile: dict[str, Any], video_url: str, audio_url: str
         "-map",
         "0:v:0",
         "-map",
-        "1:a:0",
+        f"1:a:{audio_index}",
         "-c",
         "copy",
         "-tag:v",
@@ -386,14 +456,68 @@ def build_ffmpeg_hls_cmd(profile: dict[str, Any], video_url: str, audio_url: str
         segment_time,
         "-hls_list_size",
         playlist_size,
+        "-hls_delete_threshold",
+        str(max(int(playlist_size), 10)),
         "-hls_flags",
         "delete_segments+append_list+omit_endlist",
+        "-hls_segment_type",
+        segment_type,
+    ]
+    if segment_type == "fmp4":
+        cmd += ["-hls_fmp4_init_filename", "init_index.mp4"]
+    cmd += [
         "-hls_segment_filename",
-        str(output_dir / "live_%06d.ts"),
+        str(output_dir / f"live_%06d{segment_ext}"),
         str(output_dir / "index.m3u8"),
     ]
     _ = _list_size
     return cmd
+
+
+def select_aac_audio_index(url: str, timeout_seconds: float) -> int:
+    cmd = [
+        "ffprobe",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rw_timeout",
+        str(int(timeout_seconds * 1_000_000)),
+        "-protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,data,pipe",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index,codec_name",
+        "-of",
+        "json",
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_seconds + 5)
+        data = json.loads(result.stdout or "{}") if result.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return 0
+    streams = data.get("streams") or []
+    for idx, stream in enumerate(streams):
+        if str(stream.get("codec_name") or "").lower() == "aac":
+            return idx
+    return 0
+
+
+def segment_type_for_channel(profile: dict[str, Any], video_channel: str) -> str:
+    settings = profile.get("settings") if isinstance(profile.get("settings"), dict) else {}
+    configured = str(settings.get("hls_segment_type") or profile.get("hls_segment_type") or "auto").strip().lower()
+    if configured in {"ts", "mpegts"}:
+        return "mpegts"
+    if configured in {"fmp4", "mp4"}:
+        return "fmp4"
+    video = profile.get("video") if isinstance(profile.get("video"), dict) else {}
+    text = " ".join([
+        video_channel,
+        str(video.get("primary_channel") or ""),
+        str(profile.get("channel_name") or ""),
+    ]).lower()
+    return "fmp4" if "4k" in text else "mpegts"
 
 
 def redact_command(cmd: list[str]) -> str:

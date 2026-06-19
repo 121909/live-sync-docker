@@ -39,6 +39,7 @@
           <label class="field"><span>连续不一致次数</span><input name="auto_align_samples" type="number" min="1" /></label>
           <label class="field"><span>允许误差（秒）</span><input name="auto_align_threshold" type="number" step="0.1" min="0.1" /></label>
           <label class="field"><span>最大偏移（秒）</span><input name="auto_align_max_offset" type="number" step="1" min="1" /></label>
+          <label class="field full checkbox-field"><input name="auto_align_debug_override" type="checkbox" /> <span>调试：忽略比赛时间窗口，始终允许自动对齐</span></label>
           <label class="field full"><span>优先 OCR 服务</span><select name="ocr_provider">
             <option value="">未配置</option>
             <option value="ocrspace">OCR.space 优先，自定义备用</option>
@@ -131,11 +132,13 @@
             <div class="source-browser-fields">
               <label class="field full"><span>音频 M3U 地址（每行一个）</span><textarea name="audio_playlist" form="configForm" rows="3" autocomplete="off" spellcheck="false"></textarea></label>
               <label class="field full"><span>本地音频 M3U 内容</span><textarea name="audio_local_m3u" form="configForm" rows="8" autocomplete="off" spellcheck="false" placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;本地&quot;,CCTV5&#10;http://example.com/audio.m3u8"></textarea></label>
-              <label class="field full"><span>音频频道</span><input name="audio_channel" form="configForm" autocomplete="off" /></label>
+              <label class="field"><span>音频频道</span><input name="audio_channel" form="configForm" autocomplete="off" /></label>
+              <label class="field"><span>备用音频频道</span><textarea name="audio_fallbacks" form="configForm" rows="3" spellcheck="false"></textarea></label>
             </div>
             <label class="field full"><span>过滤音频频道</span><input id="audioChannelFilter" autocomplete="off" /></label>
             <div class="channel-actions">
               <button id="useAudio" type="button">设为音频</button>
+              <button id="addAudioFallback" type="button">加入备用</button>
             </div>
             <div id="audioChannels" class="table" role="list"></div>
           </section>
@@ -155,19 +158,8 @@
             <button id="clearState" class="danger" type="button">清理状态</button>
           </div>
         </div>
-        <div id="ocrResults" class="ocr-results">
-          <div class="ocr-panel video-ocr">
-            <h3>视频计时器</h3>
-            <div id="videoOcrClock" class="ocr-clock">-</div>
-            <div id="videoOcrTime" class="ocr-time">-</div>
-          </div>
-          <div class="ocr-panel audio-ocr">
-            <h3>音频计时器</h3>
-            <div id="audioOcrClock" class="ocr-clock">-</div>
-            <div id="audioOcrTime" class="ocr-time">-</div>
-          </div>
-        </div>
-        <div id="timerRois" class="timer-rois" style="margin-top: 14px;"></div>
+        <div id="ocrResults" class="ocr-results"></div>
+        <div id="snapshotGallery" class="snapshots" style="margin-top: 14px;"></div>
         <div class="recording-panel">
           <div class="recording-head">
             <h3>录制</h3>

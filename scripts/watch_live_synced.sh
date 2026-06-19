@@ -10,7 +10,8 @@ OUT_DIR="${OUT_DIR:-/hls}"
 WORK_DIR="${WORK_DIR:-/tmp/live_4k_delay}"
 PORT="${PORT:-18080}"
 SEGMENT_TIME="${SEGMENT_TIME:-2}"
-PLAYLIST_SIZE="${PLAYLIST_SIZE:-30}"
+PLAYLIST_SIZE="${PLAYLIST_SIZE:-60}"
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-120}"
 DEFAULT_OFFSET="${DEFAULT_OFFSET:-}"
 SERVE_HLS="${SERVE_HLS:-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +20,59 @@ if [[ -z "$VIDEO_URL" || -z "$AUDIO_URL" ]]; then
   echo "VIDEO_URL and AUDIO_URL must be provided in the environment." >&2
   exit 2
 fi
+
+http_input_args() {
+  local url="$1"
+  args=(
+    -rw_timeout "$((TIMEOUT_SECONDS * 1000000))"
+    -protocol_whitelist file,http,https,tcp,tls,crypto,data,pipe
+    -reconnect 1
+    -reconnect_on_network_error 1
+    -reconnect_streamed 1
+    -reconnect_delay_max 10
+  )
+  if [[ "${url,,}" == *.m3u8* ]]; then
+    args+=(-http_persistent 0 -live_start_index -1)
+  fi
+  printf '%s\n' "${args[@]}"
+}
+
+audio_index_for_url() {
+  local url="$1"
+  local probe
+  probe="$(timeout "$((TIMEOUT_SECONDS + 5))s" ffprobe \
+    -hide_banner -loglevel error \
+    -rw_timeout "$((TIMEOUT_SECONDS * 1000000))" \
+    -protocol_whitelist file,http,https,tcp,tls,crypto,data,pipe \
+    -select_streams a \
+    -show_entries stream=index,codec_name \
+    -of json \
+    "$url" 2>/dev/null)" || {
+    echo 0
+    return
+  }
+  python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print(0)
+    raise SystemExit
+streams = data.get("streams") or []
+for idx, stream in enumerate(streams):
+    if str(stream.get("codec_name") or "").lower() == "aac":
+        print(idx)
+        raise SystemExit
+print(0)
+' <<< "$probe"
+}
+
+VIDEO_AUDIO_INDEX="$(audio_index_for_url "$VIDEO_URL" || echo 0)"
+AUDIO_INDEX="$(audio_index_for_url "$AUDIO_URL" || echo 0)"
+mapfile -t VIDEO_INPUT_OPTS < <(http_input_args "$VIDEO_URL")
+mapfile -t AUDIO_INPUT_OPTS < <(http_input_args "$AUDIO_URL")
 
 read_offset_state() {
   python3 - "$OFFSET_STATE" <<'PY'
@@ -80,11 +134,11 @@ trap cleanup EXIT INT TERM
 
 if python3 - "$OFFSET" <<'PY'
 import sys
-raise SystemExit(0 if float(sys.argv[1]) < 0.5 else 1)
+raise SystemExit(0 if abs(float(sys.argv[1])) < 0.5 else 1)
 PY
 then
   DELAY_INPUT="$VIDEO_URL"
-  DELAY_INPUT_ARGS=(-thread_queue_size 4096 -i "$DELAY_INPUT")
+  DELAY_INPUT_ARGS=("${VIDEO_INPUT_OPTS[@]}" -thread_queue_size 4096 -i "$DELAY_INPUT")
   echo "offset is near zero; using the 4K source directly"
 else
   DELAY_PLAYLIST="$WORK_DIR/4k_delay.m3u8"
@@ -96,10 +150,10 @@ print(time.monotonic())
 PY
 )"
 
-  ffmpeg \
+ ffmpeg \
     -hide_banner -loglevel warning -y \
-    -thread_queue_size 4096 -i "$VIDEO_URL" \
-    -map 0:v:0 -map 0:a:0? \
+    "${VIDEO_INPUT_OPTS[@]}" -thread_queue_size 4096 -i "$VIDEO_URL" \
+    -map 0:v:0 -map "0:a:${VIDEO_AUDIO_INDEX}?" \
     -c copy \
     -tag:v hvc1 \
     -f hls \
@@ -151,8 +205,8 @@ run_mux_to_hls() {
   ffmpeg \
     -hide_banner -loglevel warning -y \
     -re "${DELAY_INPUT_ARGS[@]}" \
-    -thread_queue_size 4096 -i "$AUDIO_URL" \
-    -map 0:v:0 -map 1:a:0 \
+    "${AUDIO_INPUT_OPTS[@]}" -thread_queue_size 4096 -i "$AUDIO_URL" \
+    -map 0:v:0 -map "1:a:${AUDIO_INDEX}" \
     -c copy \
     -tag:v hvc1 \
     -f hls \
@@ -167,8 +221,8 @@ run_mux_to_ffplay() {
   ffmpeg \
     -hide_banner -loglevel warning \
     -re "${DELAY_INPUT_ARGS[@]}" \
-    -thread_queue_size 4096 -i "$AUDIO_URL" \
-    -map 0:v:0 -map 1:a:0 \
+    "${AUDIO_INPUT_OPTS[@]}" -thread_queue_size 4096 -i "$AUDIO_URL" \
+    -map 0:v:0 -map "1:a:${AUDIO_INDEX}" \
     -c copy \
     -f matroska - | ffplay -hide_banner -loglevel warning -i -
 }

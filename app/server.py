@@ -5,6 +5,7 @@ import contextlib
 import math
 import mimetypes
 import os
+import errno
 import re
 import shutil
 import signal
@@ -58,6 +59,8 @@ ROI_PATH = STATE_DIR / "roi.json"
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
 ROI_PREVIEW_DIR = STATE_DIR / "roi_previews"
 RECORDING_DIR = STATE_DIR / "recordings"
+SNAPSHOT_KINDS = ("cache_video", "cache_audio", "video", "audio")
+OCR_NO_SCOREBOARD = object()
 CLOCK_RE = re.compile(r"(?<!\d)([0-9]{1,3})[:：.]([0-9]{2})(?!\d)")
 # Matches XX:YY+ZZ (e.g. 4:32+8, 94:32+8) - clock with stoppage minutes appended
 CLOCK_WITH_ADDED_RE = re.compile(r"(?<!\d)([0-9]{1,3})[:：.]([0-9]{2})\s*\+([0-9]{1,2})(?:\s*min?s?\.?)?(?!\d)")
@@ -78,9 +81,11 @@ DEFAULT_VIDEO_TIMER_ROI_PRESETS = "\n".join([
     "0.111,0.000,0.077,0.185",
 ])
 DEFAULT_AUDIO_TIMER_ROI_PRESETS = "0.824,0.080,0.078,0.140"
-TIMER_ROI_SCAN_INTERVAL_SECONDS = 30
+TIMER_ROI_SCAN_INTERVAL_SECONDS = 60
 TIMER_ROI_SCAN_WINDOW_SECONDS = 300
 TIMER_ROI_PREVIEW_MULTIPLIER = 9.0
+HLS_RECOVERY_WINDOW_SECONDS = int(os.environ.get("HLS_RECOVERY_WINDOW_SECONDS", "300") or 300)
+HLS_CLIENT_GRACE_SECONDS = int(os.environ.get("HLS_CLIENT_GRACE_SECONDS", "240") or 240)
 
 
 def env(name, default=""):
@@ -107,6 +112,30 @@ def m3u_sources(urls="", local_text="", local_label="本地 M3U"):
     for idx, url in enumerate(split_lines(urls), start=1):
         sources.append({"url": url, "text": "", "label": f"M3U {idx}"})
     return sources
+
+
+def prefer_garyshare_4k_sources(sources, channel_name):
+    ordered = list(sources or [])
+    if "4k" not in normalize(channel_name):
+        return ordered
+    if not any("garyshare" in str(source.get("url", "")).lower() for source in ordered):
+        return ordered
+    return sorted(
+        ordered,
+        key=lambda source: 0 if "garyshare" in str(source.get("url", "")).lower() else 1,
+    )
+
+
+def selected_audio_channels(profile):
+    channels = []
+    primary = str(profile.get("audio_channel", "") or "").strip()
+    if primary:
+        channels.append(primary)
+    for channel in profile.get("audio_fallbacks", []) or []:
+        text = str(channel).strip()
+        if text and text not in channels:
+            channels.append(text)
+    return channels
 
 
 def parse_header_lines(value):
@@ -212,14 +241,15 @@ def make_default_profile():
         "audio_playlist": env_multiline_list("AUDIO_M3U_URL"),
         "audio_local_m3u": "",
         "audio_channel": env("AUDIO_CHANNEL_NAME", ""),
+        "audio_fallbacks": env_list("FALLBACK_AUDIO_CHANNELS"),
         "offset_seconds": load_offset_default(),
         "retry_limit": int(env("RETRY_LIMIT", "3") or 3),
         "timeout_seconds": int(env("TIMEOUT_SECONDS", "25") or 25),
         "segment_time": float(env("SEGMENT_TIME", "4") or 4),
-        "playlist_size": int(env("PLAYLIST_SIZE", "30") or 30),
-        "hls_segment_type": env("HLS_SEGMENT_TYPE", "fmp4").lower(),
+        "playlist_size": int(env("PLAYLIST_SIZE", "60") or 60),
+        "hls_segment_type": env("HLS_SEGMENT_TYPE", "auto").lower(),
         "local_cache_enabled": env_bool("LOCAL_CACHE_ENABLED", True),
-        "local_cache_seconds": int(env("LOCAL_CACHE_SECONDS", "240") or 240),
+        "local_cache_seconds": int(env("LOCAL_CACHE_SECONDS", "96") or 96),
         "public_base_url": env("PUBLIC_BASE_URL", ""),
         "channel_id": env("CHANNEL_ID", "cctv5-4k-cn"),
         "channel_name": env("CHANNEL_NAME", "CCTV5 4K Chinese"),
@@ -232,6 +262,7 @@ def make_default_profile():
         "auto_align_threshold": float(env("AUTO_ALIGN_THRESHOLD", "1") or 1),
         "auto_align_max_offset": float(env("AUTO_ALIGN_MAX_OFFSET", "180") or 180),
         "auto_align_relocate_attempts": int(env("AUTO_ALIGN_RELOCATE_ATTEMPTS", "3") or 3),
+        "auto_align_debug_override": env_bool("AUTO_ALIGN_DEBUG_OVERRIDE", False),
         "snapshot_interval": auto_align_interval,
         "video_roi": env("VIDEO_TIMER_ROI", "0.050,0.050,0.070,0.050"),
         "audio_roi": env("AUDIO_TIMER_ROI", "0.885,0.085,0.075,0.060"),
@@ -320,9 +351,21 @@ def hls_stall_timeout(profile):
     return max(input_timeout, int(math.ceil(segment_seconds * 4)))
 
 
+def startup_hls_wait_timeout(profile):
+    base = hls_stall_timeout(profile)
+    offset = abs(coerce_float(profile.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"]))
+    segment_seconds = effective_segment_time(profile)
+    extra = max(0, int(math.ceil(offset + segment_seconds * 1.5))) if offset >= 0.5 else 0
+    return base + extra
+
+
 def hls_segment_type(profile):
-    value = str(profile.get("hls_segment_type", DEFAULT_PROFILE.get("hls_segment_type", "fmp4")) or "fmp4").strip().lower()
-    return "mpegts" if value in ("ts", "mpegts") else "fmp4"
+    value = str(profile.get("hls_segment_type", DEFAULT_PROFILE.get("hls_segment_type", "auto")) or "auto").strip().lower()
+    if value in ("ts", "mpegts"):
+        return "mpegts"
+    if value in ("fmp4", "mp4"):
+        return "fmp4"
+    return "auto"
 
 
 def hls_segment_ext(profile):
@@ -330,13 +373,38 @@ def hls_segment_ext(profile):
 
 
 def effective_hls_segment_type(profile, prepared=None):
-    if prepared and prepared.compatible_mux:
-        return "mpegts"
-    return hls_segment_type(profile)
+    configured = hls_segment_type(profile)
+    if configured != "auto":
+        return configured
+    return "fmp4" if prepared and prepared.channel_prefers_fmp4 else "mpegts"
 
 
 def effective_hls_segment_ext(profile, prepared=None):
     return ".ts" if effective_hls_segment_type(profile, prepared) == "mpegts" else ".m4s"
+
+
+def proc_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError, TypeError, OSError):
+        return False
+    return True
+
+
+def proc_cmdline(pid):
+    try:
+        raw = (Path("/proc") / str(int(pid)) / "cmdline").read_bytes()
+    except (OSError, ValueError, TypeError):
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+
+
+def kill_pid(pid, sig):
+    try:
+        os.kill(int(pid), sig)
+        return True
+    except (ProcessLookupError, ValueError, TypeError, OSError):
+        return False
 
 
 def strip_dovi_rpu():
@@ -408,6 +476,7 @@ OCR_PROVIDER_LABELS = {
     "ocrspace": "OCR.space",
     "custom": "自定义 OCR",
 }
+OCR_FALLBACK_COOLDOWN_SECONDS = int(os.environ.get("OCR_FALLBACK_COOLDOWN_SECONDS", "180") or 180)
 
 
 def normalize_ocr_provider(value):
@@ -467,6 +536,7 @@ RUNTIME_AUTO_ALIGN_KEYS = {
     "auto_align_threshold",
     "auto_align_max_offset",
     "auto_align_relocate_attempts",
+    "auto_align_debug_override",
     "video_roi",
     "audio_roi",
     "video_roi_presets",
@@ -491,7 +561,9 @@ def effective_local_cache_seconds(profile):
     segment = effective_segment_time(profile)
     configured = coerce_int(profile.get("local_cache_seconds"), DEFAULT_PROFILE["local_cache_seconds"], minimum=30)
     offset = abs(coerce_float(profile.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"]))
-    return int(math.ceil(max(configured, offset + segment * 6)))
+    # Keep enough cache for smooth handoff, but cap growth so long-running
+    # sessions do not accumulate multi-hundred-MB source caches per side.
+    return int(math.ceil(min(configured, max(30, min(offset + segment * 3, 120)))))
 
 
 def local_cache_list_size(profile):
@@ -592,6 +664,15 @@ class LocalSourceCache:
     audio_proc: object | None = None
 
 
+@dataclass(frozen=True)
+class PipelineFailure:
+    reason: str
+    kind: str = "unknown"
+
+    def __str__(self):
+        return self.reason
+
+
 @dataclass
 class PreparedPipeline:
     offset: float
@@ -604,10 +685,12 @@ class PreparedPipeline:
     single_input_av: bool = False
     video_codec: str = ""
     compatible_mux: bool = False
+    channel_prefers_fmp4: bool = False
     video_input_label: str = "direct video"
     audio_input_label: str = "direct audio"
     video_snapshot_input: list = field(default_factory=list)
     audio_snapshot_input: list = field(default_factory=list)
+    snapshot_jobs: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -619,26 +702,18 @@ class ClockParse:
 
 @dataclass
 class AlignmentMonitor:
-    video_roi: tuple | None = None
-    audio_roi: tuple | None = None
-    video_roi_locked: bool = False
-    audio_roi_locked: bool = False
     video_clock: str = ""
     audio_clock: str = ""
     state: str = "acquiring"
-    message: str = "waiting for timer ROI"
+    message: str = "waiting for OCR"
     mismatch_offsets: list = field(default_factory=list)
     mismatch_count: int = 0
     checks: int = 0
     video_missing_count: int = 0
     audio_missing_count: int = 0
-    video_next_probe_at: float = 0.0
-    audio_next_probe_at: float = 0.0
-    video_search_started_at: float = 0.0
-    audio_search_started_at: float = 0.0
 
     def locked(self):
-        return self.video_roi_locked and self.audio_roi_locked
+        return True
 
     def snapshot(self):
         return {
@@ -646,10 +721,6 @@ class AlignmentMonitor:
             "message": self.message,
             "mismatch_count": self.mismatch_count,
             "checks": self.checks,
-            "video_roi": self.video_roi,
-            "audio_roi": self.audio_roi,
-            "video_roi_locked": self.video_roi_locked,
-            "audio_roi_locked": self.audio_roi_locked,
             "video_clock": self.video_clock,
             "audio_clock": self.audio_clock,
         }
@@ -947,11 +1018,17 @@ class LiveManager:
         self.recording_stop_event = threading.Event()
         self.recording_proc = None
         self.recording_session = None
+        self.active_hls_playlist = HLS_DIR / "index.m3u8"
+        self.hls_preserved_assets = deque(maxlen=16)
+        self.managed_pidfile = STATE_DIR / "live_manager.pid"
+        self.restart_request_id = 0
+        self.ocr_provider_cooldowns = {}
         self.status = {
             "running": False,
             "stage": "stopped",
             "active_channel": "",
             "active_url": "",
+            "active_audio_channel": "",
             "audio_url": "",
             "failure_count": 0,
             "last_error": "",
@@ -966,7 +1043,7 @@ class LiveManager:
             "last_alignment": None,
             "auto_align_offset_seconds": None,
             "last_snapshot_at": None,
-            "last_ocr_results": {"video": None, "audio": None},
+            "last_ocr_results": {kind: None for kind in SNAPSHOT_KINDS},
             "ocr_request_count": 0,
             "ocr_request_last_at": None,
             "ocr_request_last_provider": "",
@@ -986,12 +1063,74 @@ class LiveManager:
                 "active": None,
             },
         }
+        self._reclaim_runtime_processes()
 
     def log(self, message):
         line = f"[{now()}] {message}"
         with self.lock:
             self.logs.append(line)
         print(line, flush=True)
+
+    def _reclaim_runtime_processes(self):
+        self._reap_previous_manager_pid()
+        self._cleanup_orphan_runtime_ffmpeg()
+        self._prune_handoff_hls()
+        self._write_manager_pid()
+
+    def _write_manager_pid(self):
+        try:
+            self.managed_pidfile.parent.mkdir(parents=True, exist_ok=True)
+            self.managed_pidfile.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _reap_previous_manager_pid(self):
+        try:
+            previous = int(self.managed_pidfile.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            previous = 0
+        current = os.getpid()
+        if previous and previous != current and proc_alive(previous):
+            previous_cmdline = proc_cmdline(previous)
+            if "app/server.py" not in previous_cmdline:
+                return
+            kill_pid(previous, signal.SIGTERM)
+            deadline = time.time() + 5
+            while time.time() < deadline and proc_alive(previous):
+                time.sleep(0.1)
+            if proc_alive(previous):
+                kill_pid(previous, signal.SIGKILL)
+
+    def _cleanup_orphan_runtime_ffmpeg(self):
+        runtime_markers = (
+            str(WORK_DIR.resolve()),
+            str(HLS_DIR.resolve()),
+        )
+        proc_root = Path("/proc")
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == os.getpid():
+                continue
+            cmdline_path = entry / "cmdline"
+            try:
+                raw = cmdline_path.read_bytes()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            text = raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            if "ffmpeg" not in text:
+                continue
+            if not any(marker in text for marker in runtime_markers):
+                continue
+            kill_pid(pid, signal.SIGTERM)
+            deadline = time.time() + 3
+            while time.time() < deadline and proc_alive(pid):
+                time.sleep(0.05)
+            if proc_alive(pid):
+                kill_pid(pid, signal.SIGKILL)
 
     def get_profile(self):
         with self.lock:
@@ -1022,6 +1161,7 @@ class LiveManager:
         merged["video_primary"] = str(merged.get("video_primary", "") or "")
         merged["audio_channel"] = str(merged.get("audio_channel", "") or "")
         merged["video_fallbacks"] = [str(x).strip() for x in merged.get("video_fallbacks", []) if str(x).strip()]
+        merged["audio_fallbacks"] = [str(x).strip() for x in merged.get("audio_fallbacks", []) if str(x).strip()]
         merged["offset_seconds"] = coerce_float(merged.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"])
         merged["retry_limit"] = coerce_int(merged.get("retry_limit"), DEFAULT_PROFILE["retry_limit"], minimum=1)
         merged["timeout_seconds"] = coerce_int(merged.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
@@ -1031,12 +1171,13 @@ class LiveManager:
         merged["local_cache_enabled"] = parse_bool(merged.get("local_cache_enabled", DEFAULT_PROFILE["local_cache_enabled"]))
         merged["local_cache_seconds"] = coerce_int(merged.get("local_cache_seconds"), DEFAULT_PROFILE["local_cache_seconds"], minimum=30)
         interval_value = raw_profile.get("auto_align_interval", raw_profile.get("snapshot_interval", merged.get("auto_align_interval")))
-        merged["auto_align_interval"] = coerce_int(interval_value, DEFAULT_PROFILE["auto_align_interval"], minimum=5)
+        merged["auto_align_interval"] = coerce_int(interval_value, DEFAULT_PROFILE["auto_align_interval"], minimum=60)
         merged["auto_align_samples"] = coerce_int(merged.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=3)
         merged["auto_align_step"] = coerce_float(merged.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"], minimum=0.5)
         merged["auto_align_threshold"] = coerce_float(merged.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
         merged["auto_align_max_offset"] = coerce_float(merged.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"], minimum=1)
         merged["auto_align_relocate_attempts"] = coerce_int(merged.get("auto_align_relocate_attempts"), DEFAULT_PROFILE["auto_align_relocate_attempts"], minimum=0)
+        merged["auto_align_debug_override"] = parse_bool(merged.get("auto_align_debug_override", DEFAULT_PROFILE["auto_align_debug_override"]))
         merged["snapshot_interval"] = merged["auto_align_interval"]
         merged["schedule_enabled"] = parse_bool(merged.get("schedule_enabled", DEFAULT_PROFILE["schedule_enabled"]))
         merged["schedule_provider"] = coerce_text(merged.get("schedule_provider"), DEFAULT_PROFILE["schedule_provider"])
@@ -1093,6 +1234,7 @@ class LiveManager:
             status["auto_align"] = {
                 "enabled": ocr_provider_ready(aa),
                 "active_allowed": self._auto_align_allowed_by_schedule(aa),
+                "debug_override": parse_bool(aa.get("auto_align_debug_override", DEFAULT_PROFILE["auto_align_debug_override"])),
                 "interval": coerce_int(aa.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"]),
                 "samples": coerce_int(aa.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"]),
                 "step": coerce_float(aa.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"]),
@@ -1105,8 +1247,13 @@ class LiveManager:
             status["auto_align_monitor"] = dict(self.status.get("auto_align_monitor") or {})
             status["hls_url"] = "/index.m3u8"
             status["emby_url"] = "/emby.m3u"
-            playlist = HLS_DIR / "index.m3u8"
-            segments = sorted(list(HLS_DIR.glob("live_*.ts")) + list(HLS_DIR.glob("live_*.m4s")))
+            playlist = self._current_served_hls_playlist()
+            segment_names = self._playlist_segments(playlist)
+            segments = [
+                HLS_DIR / name
+                for name in segment_names
+                if name and (HLS_DIR / name).exists()
+            ]
             playlist_exists = playlist.exists()
             playlist_mtime = None
             if playlist_exists:
@@ -1120,10 +1267,15 @@ class LiveManager:
                 "segment_count": len(segments),
                 "latest_segment": segments[-1].name if segments else "",
                 "segment_type": hls_segment_type(self.profile),
+                "source_playlist": Path(self.active_hls_playlist).name if self.active_hls_playlist else "index.m3u8",
             }
             status["schedule"] = self._schedule_status_snapshot()
             status["recording"] = self._recording_status_snapshot()
             return status
+
+    def _current_served_hls_playlist(self):
+        playlist = Path(self.active_hls_playlist or (HLS_DIR / "index.m3u8"))
+        return playlist if playlist.is_absolute() else HLS_DIR / playlist
 
     def start(self, source="manual"):
         with self.lock:
@@ -1154,7 +1306,10 @@ class LiveManager:
             self.thread.start()
         self.log(f"live pipeline requested ({source})")
 
-    def stop(self, source="manual"):
+    def stop(self, source="manual", cancel_restart=True):
+        with self.lock:
+            if cancel_restart:
+                self.restart_request_id += 1
         with self.lock:
             if source == "manual":
                 active_id = ""
@@ -1179,16 +1334,59 @@ class LiveManager:
     def restart(self, profile=None, source="manual"):
         if profile:
             self.set_profile(profile)
-        self.stop(source=source)
-        thread = None
+        with self.lock:
+            self.restart_request_id += 1
+            request_id = self.restart_request_id
+        self.stop(source=source, cancel_restart=False)
         with self.lock:
             thread = self.thread
-        if thread and thread.is_alive():
-            thread.join(timeout=10)
-        with self.lock:
+            if self.thread and self.thread.is_alive():
+                self.status["stage"] = "restarting"
+                self.log(f"restart queued ({source}): waiting for previous pipeline to stop")
+                threading.Thread(
+                    target=self._restart_when_stopped,
+                    args=(request_id, source),
+                    name="live-sync-restart-waiter",
+                    daemon=True,
+                ).start()
+                return
             if self.thread and not self.thread.is_alive():
                 self.thread = None
         self.start(source=source)
+
+    def _restart_when_stopped(self, request_id, source):
+        while True:
+            with self.lock:
+                if request_id != self.restart_request_id:
+                    return
+                thread = self.thread
+            if not thread or not thread.is_alive():
+                break
+            thread.join(timeout=0.5)
+        with self.lock:
+            if request_id != self.restart_request_id:
+                return
+            if self.thread and not self.thread.is_alive():
+                self.thread = None
+        self.start(source=source)
+
+    def _resolve_audio_channel(self, profile, audio_sources, force=False):
+        channels = selected_audio_channels(profile)
+        if not channels:
+            raise RuntimeError("audio channel name is empty (audio playlist is set but audio_channel field is blank)")
+
+        last_exc = None
+        for channel_name in channels:
+            try:
+                audio = self.resolver.find_any_sources(audio_sources, channel_name, force=force)
+                return audio, channel_name
+            except Exception as exc:
+                last_exc = exc
+                self.log(f"audio resolve failed for {channel_name}: {exc}")
+
+        if last_exc:
+            raise RuntimeError(str(last_exc))
+        raise RuntimeError("audio source unavailable")
 
     def _run_loop(self):
         profile = self.get_profile()
@@ -1206,29 +1404,30 @@ class LiveManager:
         index = 0
         failures = 0
         current_url = ""
+        preserve_hls = self._should_preserve_hls()
         while not self.stop_event.is_set():
             channel_name = channels[index]
             force_refresh = failures >= int(profile.get("retry_limit", 3))
+            channel_video_sources = prefer_garyshare_4k_sources(video_sources, channel_name)
             try:
-                video = self.resolver.find_any_sources(video_sources, channel_name, force=force_refresh)
+                video = self.resolver.find_any_sources(channel_video_sources, channel_name, force=force_refresh)
             except Exception as exc:
                 self.log(f"video resolve failed for {channel_name}: {exc}")
                 index += 1
                 failures = 0
                 if index >= len(channels):
-                    self._fail("all selected video channels failed to resolve")
-                    return
+                    index = 0
+                    self.log("all selected video channels failed to resolve; retrying from the first configured channel")
+                    time.sleep(5)
                 continue
 
             try:
                 if not audio_sources:
                     audio = Channel(name="no audio", url="")
+                    active_audio_channel = ""
                     self.log("no audio M3U configured; running video-only")
                 else:
-                    ac = profile.get("audio_channel", "").strip()
-                    if not ac:
-                        raise RuntimeError(f"audio channel name is empty (audio playlist is set but audio_channel field is blank)")
-                    audio = self.resolver.find_any_sources(audio_sources, ac, force=force_refresh)
+                    audio, active_audio_channel = self._resolve_audio_channel(profile, audio_sources, force=force_refresh)
             except Exception as exc:
                 self.log(f"audio resolve failed: {exc}")
                 self._fail(f"audio source unavailable: {exc}")
@@ -1241,8 +1440,10 @@ class LiveManager:
                 index += 1
                 failures = 0
                 if index >= len(channels):
-                    self._fail("all selected video channels failed")
-                    return
+                    index = 0
+                    self.log("all selected video channels failed; retrying from the first configured channel")
+                    time.sleep(5)
+                    continue
                 self.log(f"{channel_name} URL unchanged after {profile.get('retry_limit', 3)} failures; falling back to {channels[index]}")
                 continue
 
@@ -1252,23 +1453,32 @@ class LiveManager:
                     "stage": "running",
                     "active_channel": channel_name,
                     "active_url": _redact_url(video.url),
+                    "active_audio_channel": active_audio_channel,
                     "audio_url": _redact_url(audio.url),
                     "failure_count": failures,
                     "last_resolution": f"{channel_name} -> {_redact_url(video.url)}",
                     "offset_seconds": profile.get("offset_seconds", 0),
                 })
 
-            reason = self._run_pipeline(video, audio, profile)
+            reason = self._run_pipeline(video, audio, profile, preserve_hls=preserve_hls)
+            preserve_hls = self._should_preserve_hls()
             if self.stop_event.is_set():
                 break
-            if reason.startswith("re-aligned"):
+            failure = reason if isinstance(reason, PipelineFailure) else PipelineFailure(str(reason))
+            if failure.reason.startswith("re-aligned"):
                 failures = 0
                 continue
-            failures += 1
+            if failure.kind == "audio":
+                failures = 0
+            else:
+                failures += 1
             with self.lock:
                 self.status["failure_count"] = failures
-                self.status["last_error"] = reason
-            self.log(f"pipeline failed for {channel_name}: {reason} (failure {failures}/{profile.get('retry_limit', 3)})")
+                self.status["last_error"] = failure.reason
+            if failure.kind == "audio":
+                self.log(f"pipeline failed for {channel_name}: {failure.reason} (audio source; keeping video channel)")
+            else:
+                self.log(f"pipeline failed for {channel_name}: {failure.reason} (failure {failures}/{profile.get('retry_limit', 3)})")
 
         self._stop_processes()
         with self.lock:
@@ -1283,6 +1493,8 @@ class LiveManager:
     def _clear_hls(self):
         HLS_DIR.mkdir(parents=True, exist_ok=True)
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        self.active_hls_playlist = HLS_DIR / "index.m3u8"
+        self.hls_preserved_assets.clear()
         for item in HLS_DIR.iterdir():
             if item.name == "snapshots":
                 continue
@@ -1332,16 +1544,102 @@ class LiveManager:
                         pass
 
     def _process_tail_summary(self, proc, max_lines=6):
-        with self.lock:
-            lines = list(self.process_tails.get(proc.pid, []))[-max_lines:]
+        lines = self._process_tail_lines(proc, max_lines=max_lines)
         if not lines:
             return ""
         return " | recent stderr: " + " || ".join(_redact_url(line) for line in lines)
+
+    def _process_tail_lines(self, proc, max_lines=6):
+        if proc is None:
+            return []
+        with self.lock:
+            lines = list(self.process_tails.get(proc.pid, []))[-max_lines:]
+        return lines
 
     def _mux_failure_detail(self, mux, pipeline):
         context = f" | context: {pipeline.video_input_label}; {pipeline.audio_input_label}"
         tail = self._process_tail_summary(mux, max_lines=12)
         return context + tail
+
+    def _source_cache_failure(self, source_cache):
+        if not source_cache:
+            return None
+        checks = (
+            ("video", source_cache.video_proc),
+            ("audio", source_cache.audio_proc),
+        )
+        for kind, proc in checks:
+            if not proc or proc.poll() is None:
+                continue
+            tail = self._process_tail_summary(proc, max_lines=8)
+            return PipelineFailure(f"{kind} source cache exited with code {proc.returncode}{tail}", kind=kind)
+        return None
+
+    def _playlist_latest_mtime(self, playlist_path):
+        playlist = Path(playlist_path or "")
+        paths = [playlist]
+        for segment in self._playlist_segments(playlist):
+            paths.append(playlist.parent / segment)
+        mtimes = []
+        for path in paths:
+            try:
+                if path.exists():
+                    mtimes.append(path.stat().st_mtime)
+            except FileNotFoundError:
+                pass
+        return max(mtimes) if mtimes else 0
+
+    def _source_cache_stall_failure(self, source_cache, timeout):
+        if not source_cache:
+            return None
+        now_ts = time.time()
+        checks = []
+        if source_cache.video and source_cache.video.url:
+            checks.append(("video", source_cache.video.url))
+        if source_cache.audio and source_cache.audio.url:
+            checks.append(("audio", source_cache.audio.url))
+        stale = []
+        fresh = []
+        for kind, playlist in checks:
+            mtime = self._playlist_latest_mtime(playlist)
+            if not mtime:
+                stale.append((kind, "missing"))
+            elif now_ts - mtime > timeout:
+                stale.append((kind, f"{now_ts - mtime:.1f}s old"))
+            else:
+                fresh.append(kind)
+        if len(stale) == 1:
+            kind, detail = stale[0]
+            return PipelineFailure(f"{kind} source cache stopped updating ({detail})", kind=kind)
+        if stale and not fresh:
+            details = ", ".join(f"{kind} {detail}" for kind, detail in stale)
+            return PipelineFailure(f"source caches stopped updating ({details})", kind="unknown")
+        return None
+
+    def _classify_stall_failure(self, source_cache, detail):
+        cache_failure = self._source_cache_failure(source_cache)
+        if cache_failure:
+            return cache_failure
+        text = str(detail or "").lower()
+        audio_markers = (
+            "input1=local cache audio",
+            "source=audio",
+            "audio_cache",
+            "audio-cache",
+            "audio source cache",
+        )
+        video_markers = (
+            "input0=local video",
+            "source=video",
+            "video_cache",
+            "video-cache",
+            "video source cache",
+        )
+        has_audio = any(marker in text for marker in audio_markers)
+        has_video = any(marker in text for marker in video_markers)
+        if has_audio and not has_video:
+            return PipelineFailure(detail, kind="audio")
+        return PipelineFailure(detail, kind="unknown")
 
     def _stop_processes(self, procs=None):
         if procs is None:
@@ -1410,8 +1708,9 @@ class LiveManager:
             "-user_agent", user_agent,
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data,pipe",
             "-reconnect", "1",
+            "-reconnect_on_network_error", "1",
             "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
+            "-reconnect_delay_max", "10",
         ]
         if urlsplit(str(url)).path.lower().endswith(".m3u8"):
             args += ["-http_persistent", "0", "-live_start_index", "-1"]
@@ -1449,26 +1748,56 @@ class LiveManager:
         codec = result.stdout.strip().splitlines()
         return codec[0].strip().lower() if codec else ""
 
-    def _probe_audio_codec(self, channel, timeout):
+    def _probe_audio_streams(self, channel, timeout):
         if not channel or not channel.url:
-            return ""
+            return []
         cmd = [
             "ffprobe", "-hide_banner", "-loglevel", "error",
             "-rw_timeout", str(timeout * 1_000_000),
             *self._http_input_options(channel.url, channel.headers),
             *self._local_hls_input_options(channel.url, -1),
-            "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "default=nokey=1:noprint_wrappers=1",
+            "-select_streams", "a",
+            "-show_entries", "stream=index,codec_name",
+            "-of", "json",
             channel.url,
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5, check=True)
         except Exception as exc:
-            self.log(f"audio codec probe failed for {channel.name}: {exc}; using generic copy path")
-            return ""
-        codec = result.stdout.strip().splitlines()
-        return codec[0].strip().lower() if codec else ""
+            self.log(f"audio stream probe failed for {channel.name}: {exc}; using first audio stream")
+            return []
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return []
+        streams = []
+        for relative_idx, stream in enumerate(data.get("streams") or []):
+            codec = str(stream.get("codec_name") or "").strip().lower()
+            streams.append({
+                "relative_index": relative_idx,
+                "absolute_index": stream.get("index"),
+                "codec": codec,
+            })
+        return streams
+
+    def _select_audio_stream(self, channel, timeout):
+        streams = self._probe_audio_streams(channel, timeout)
+        selected = None
+        for stream in streams:
+            if stream.get("codec") == "aac":
+                selected = stream
+                break
+        if selected is None and streams:
+            selected = streams[0]
+        if not selected:
+            return 0, ""
+        relative_idx = int(selected.get("relative_index") or 0)
+        codec = selected.get("codec") or ""
+        if codec == "aac":
+            self.log(f"audio stream selected for {channel.name}: a:{relative_idx} codec=aac")
+        elif codec:
+            self.log(f"audio stream selected for {channel.name}: a:{relative_idx} codec={codec}; AAC not found")
+        return relative_idx, codec
 
     def _video_copy_args(self, codec):
         args = ["-c:v", "copy"]
@@ -1487,10 +1816,13 @@ class LiveManager:
                 return source.endswith(".m3u8")
         return False
 
-    def _start_local_cache_recorder(self, channel, playlist, profile, kind):
+    def _start_local_cache_recorder(self, channel, playlist, profile, kind, audio_stream_index=0):
         segment = f"{effective_segment_time(profile):.3f}"
         list_size = local_cache_list_size(profile)
         segment_name = playlist.parent / f"{kind}_cache_%06d.ts"
+        # Keep a video stream in the audio cache so OCR/snapshot jobs can read
+        # the commentary timer frame while mux still maps only the audio stream.
+        map_args = ["-map", "0:v:0?", "-map", f"0:a:{int(audio_stream_index)}?"]
         header_label = f", headers={','.join(channel.headers.keys())}" if channel.headers else ""
         context = (
             f"source={kind} url={channel.url}{header_label}; "
@@ -1502,10 +1834,10 @@ class LiveManager:
             *self._http_input_options(channel.url, channel.headers),
             "-fflags", "+discardcorrupt",
             "-thread_queue_size", "4096", "-i", channel.url,
-            "-map", "0:v:0?", "-map", "0:a:0?",
+            *map_args,
             "-c", "copy",
             "-f", "hls", "-hls_time", segment, "-hls_list_size", str(list_size),
-            "-hls_delete_threshold", str(max(list_size, 10)),
+            "-hls_delete_threshold", "2",
             "-hls_flags", "delete_segments+omit_endlist+append_list",
             "-hls_segment_filename", str(segment_name),
             str(playlist),
@@ -1523,13 +1855,15 @@ class LiveManager:
             audio_proc = None
             video_proc = None
             try:
-                video_proc = self._start_local_cache_recorder(video, video_playlist, profile, "video")
                 same_source = bool(audio and audio.url) and video.url == audio.url and dict(video.headers) == dict(audio.headers)
+                source_audio = video if same_source else audio
+                audio_stream_index, _audio_codec = self._select_audio_stream(source_audio, coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)) if source_audio and source_audio.url else (0, "")
+                video_proc = self._start_local_cache_recorder(video, video_playlist, profile, "video", audio_stream_index=audio_stream_index if same_source else 0)
                 if audio and audio.url:
                     if same_source:
                         cached_audio = Channel(name=audio.name, url=str(video_playlist), tvg_id=audio.tvg_id, tvg_name=audio.tvg_name, group=audio.group)
                     else:
-                        audio_proc = self._start_local_cache_recorder(audio, audio_playlist, profile, "audio")
+                        audio_proc = self._start_local_cache_recorder(audio, audio_playlist, profile, "audio", audio_stream_index=audio_stream_index)
                         cached_audio = Channel(name=audio.name, url=str(audio_playlist), tvg_id=audio.tvg_id, tvg_name=audio.tvg_name, group=audio.group)
                 else:
                     cached_audio = Channel(name="no audio", url="")
@@ -1554,13 +1888,15 @@ class LiveManager:
             raise last_exc
         raise RuntimeError("local cache warmup failed")
 
-    def _start_delay_recorder(self, channel, playlist, segment, list_size, timeout, kind, video_codec=""):
+    def _start_delay_recorder(self, channel, playlist, segment, list_size, timeout, kind, video_codec="", audio_stream_index=0):
         url = channel.url
         segment_name = playlist.parent / f"{kind}_%06d.ts"
         if kind == "video":
             stream_args = ["-map", "0:v:0", "-an", *self._video_copy_args(video_codec)]
         else:
-            stream_args = ["-map", "0:a:0", "-vn", "-c:a", "copy"]
+            # Keep an optional video stream in delayed audio HLS so snapshot/OCR
+            # can still read frames from the commentary source during re-alignment.
+            stream_args = ["-map", "0:v:0?", "-map", f"0:a:{int(audio_stream_index)}?", "-c", "copy"]
         header_label = f", headers={','.join(channel.headers.keys())}" if channel.headers else ""
         context = f"source={kind} url={url}{header_label}; output={playlist.name}"
         return self._start_process([
@@ -1645,11 +1981,20 @@ class LiveManager:
         segment = f"{segment_seconds:.3f}"
         delay_procs = []
         video_codec = self._probe_video_codec(video, timeout)
-        audio_codec = self._probe_audio_codec(audio, timeout) if audio_url else ""
-        compatible_mux = video_codec not in ("hevc", "h265")
-        mux_segment_type = "mpegts" if compatible_mux else hls_segment_type(profile)
+        audio_stream_index, audio_codec = self._select_audio_stream(audio, timeout) if audio_url else (0, "")
+        channel_text = " ".join([
+            str(getattr(video, "name", "") or ""),
+            str(getattr(video, "tvg_name", "") or ""),
+            str(getattr(video, "tvg_id", "") or ""),
+            str(profile.get("channel_name", "") or ""),
+            str(profile.get("video_primary", "") or ""),
+        ]).lower()
+        channel_prefers_fmp4 = "4k" in channel_text
+        configured_segment_type = hls_segment_type(profile)
+        compatible_mux = configured_segment_type == "auto" and not channel_prefers_fmp4
+        mux_segment_type = configured_segment_type if configured_segment_type != "auto" else ("fmp4" if channel_prefers_fmp4 else "mpegts")
         if video_codec:
-            mux_mode = "mpegts compatibility" if compatible_mux else "configured HLS"
+            mux_mode = "auto mpegts" if compatible_mux else mux_segment_type
             self.log(f"video codec detected: {video_codec}; mux mode: {mux_mode}")
         same_source = (
             bool(audio_url)
@@ -1666,16 +2011,17 @@ class LiveManager:
         audio_input = []
         audio_map = ""
         if single_input_av:
-            audio_map = "0:a:0"
+            audio_map = f"0:a:{audio_stream_index}"
             audio_input_label = f"input0=audio from same {source_kind} source ({audio_url}{audio_header_label})"
         elif audio_url:
             audio_input = self._direct_input(audio_url, timeout, audio.headers, live_start_index=cache_live_start)
-            audio_map = "1:a:0"
+            audio_map = f"1:a:{audio_stream_index}"
             audio_input_label = f"input1={source_kind} audio ({audio_url}{audio_header_label})"
         else:
             audio_input_label = "input1=none"
         video_snapshot_input = list(video_input)
         audio_snapshot_input = list(video_input if single_input_av else audio_input)
+        snapshot_jobs = []
         audio_copy_bsf = ""
 
         try:
@@ -1694,7 +2040,7 @@ class LiveManager:
                     raise RuntimeError("negative offset requires an audio source")
                 delay_playlist = run_dir / "audio_delay.m3u8"
                 list_size = max(20, int(abs(offset) / segment_seconds) + 20)
-                recorder = self._start_delay_recorder(audio, delay_playlist, segment, list_size, timeout, "audio")
+                recorder = self._start_delay_recorder(audio, delay_playlist, segment, list_size, timeout, "audio", audio_stream_index=audio_stream_index)
                 delay_procs.append(recorder)
                 self._buffer_delay_input(recorder, delay_playlist, offset, timeout, "buffering audio")
                 audio_input = ["-thread_queue_size", "4096", "-live_start_index", "-1", "-i", str(delay_playlist)]
@@ -1705,6 +2051,19 @@ class LiveManager:
             self._stop_processes(delay_procs)
             shutil.rmtree(run_dir, ignore_errors=True)
             raise
+
+        if source_cache:
+            snapshot_jobs.append(("cache_video", list(self._direct_input(source_cache.video.url, timeout, video.headers, live_start_index=-1)), f"{video.name} 缓存前"))
+            if source_cache.audio and source_cache.audio.url:
+                snapshot_jobs.append(("cache_audio", list(self._direct_input(source_cache.audio.url, timeout, audio.headers, live_start_index=-1)), f"{audio.name} 缓存前"))
+        else:
+            snapshot_jobs.append(("cache_video", list(self._direct_input(video_url, timeout, video.headers)), f"{video.name} 原始"))
+            if audio_url:
+                cache_audio_input = list(video_input if single_input_av else self._direct_input(audio_url, timeout, audio.headers))
+                snapshot_jobs.append(("cache_audio", cache_audio_input, f"{audio.name} 原始"))
+        snapshot_jobs.append(("video", list(video_snapshot_input), f"{video.name} 延迟后"))
+        if audio_snapshot_input:
+            snapshot_jobs.append(("audio", list(audio_snapshot_input), f"{audio.name if audio else 'audio'} 延迟后"))
 
         audio_copy_bsf = ""
         if audio_map and output_audio_codec() == "copy":
@@ -1723,10 +2082,12 @@ class LiveManager:
             single_input_av=single_input_av,
             video_codec=video_codec,
             compatible_mux=compatible_mux,
+            channel_prefers_fmp4=channel_prefers_fmp4,
             video_input_label=video_input_label,
             audio_input_label=audio_input_label,
             video_snapshot_input=video_snapshot_input,
             audio_snapshot_input=audio_snapshot_input,
+            snapshot_jobs=snapshot_jobs,
         )
 
     def _reserve_handoff_start_number(self, profile):
@@ -1758,15 +2119,12 @@ class LiveManager:
             cmd += ["-map", prepared.audio_map]
         cmd += self._video_copy_args(prepared.video_codec)
         if prepared.audio_map:
-            if output_audio_codec() == "copy":
-                cmd += ["-c:a", "copy"]
-                if prepared.audio_copy_bsf:
-                    cmd += ["-bsf:a", prepared.audio_copy_bsf]
-            else:
-                cmd += ["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"]
+            cmd += ["-c:a", "copy"]
+            if prepared.audio_copy_bsf:
+                cmd += ["-bsf:a", prepared.audio_copy_bsf]
         cmd += [
             "-f", "hls", "-hls_time", segment, "-hls_list_size", str(playlist_size),
-            "-hls_delete_threshold", str(max(playlist_size, 10)),
+            "-hls_delete_threshold", "2",
             "-start_number", str(start_number),
             "-hls_flags", hls_flags,
             "-hls_segment_type", segment_type,
@@ -1859,33 +2217,122 @@ class LiveManager:
         return prepared, new_mux
 
     def _publish_hls_playlist(self, playlist_path):
-        index = HLS_DIR / "index.m3u8"
-        tmp = HLS_DIR / ".index.m3u8.tmp"
-        tmp.unlink(missing_ok=True)
-        try:
-            os.symlink(playlist_path.name, tmp)
-            os.replace(tmp, index)
-        finally:
-            tmp.unlink(missing_ok=True)
+        previous = self._current_served_hls_playlist()
+        if previous.exists() and previous != Path(playlist_path):
+            self._remember_hls_assets(previous)
+        self.active_hls_playlist = Path(playlist_path)
+        self._sync_active_hls_playlist(force=True)
         self._prune_handoff_hls()
 
-    def _prune_handoff_hls(self):
-        playlist = HLS_DIR / "index.m3u8"
+    def _sync_active_hls_playlist(self, force=False):
+        active = Path(self.active_hls_playlist or (HLS_DIR / "index.m3u8"))
+        index = HLS_DIR / "index.m3u8"
+        if active == index:
+            return
+        if not active.exists():
+            raise FileNotFoundError(f"active HLS playlist missing: {active.name}")
+        try:
+            source_text = active.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise RuntimeError(f"failed to read active HLS playlist {active.name}: {exc}") from exc
+        if not force and index.exists():
+            try:
+                if index.read_text(encoding="utf-8", errors="replace") == source_text:
+                    return
+            except OSError:
+                pass
+        tmp = HLS_DIR / ".index.m3u8.tmp"
+        tmp.write_text(source_text, encoding="utf-8")
+        os.replace(tmp, index)
+
+    def _playlist_referenced_files(self, playlist_path):
+        playlist = Path(playlist_path)
         referenced = set(self._playlist_segments(playlist))
         try:
             for line in playlist.read_text(encoding="utf-8", errors="replace").splitlines():
                 line = line.strip()
-                if line and not line.startswith("#") and line.endswith(".mp4"):
+                if not line:
+                    continue
+                map_match = HLS_MAP_URI_RE.search(line)
+                if map_match:
+                    referenced.add(Path(map_match.group(1)).name)
+                elif not line.startswith("#") and line.endswith(".mp4"):
                     referenced.add(Path(line).name)
         except FileNotFoundError:
+            return set()
+        return referenced
+
+    def _trim_preserved_hls_references(self, referenced):
+        referenced = set(referenced or ())
+        if not referenced:
+            return referenced
+        playlist_size = coerce_int(self.profile.get("playlist_size"), DEFAULT_PROFILE["playlist_size"], minimum=3)
+        keep_live = max(playlist_size, 12) + 4
+        live_segments = []
+        for name in referenced:
+            path = Path(name)
+            if path.name.startswith("live_") and path.suffix in (".ts", ".m4s"):
+                number = self._hls_segment_number(path)
+                if number is not None:
+                    live_segments.append((number, path.name))
+        live_segments.sort()
+        keep_live_names = {name for _number, name in live_segments[-keep_live:]}
+        trimmed = set()
+        for name in referenced:
+            path = Path(name)
+            if path.name.startswith("live_") and path.suffix in (".ts", ".m4s"):
+                if path.name in keep_live_names:
+                    trimmed.add(path.name)
+                continue
+            trimmed.add(path.name)
+        return trimmed
+
+    def _remember_hls_assets(self, playlist_path):
+        referenced = self._trim_preserved_hls_references(self._playlist_referenced_files(playlist_path))
+        if not referenced:
             return
+        self.hls_preserved_assets.append({
+            "playlist": Path(playlist_path).name,
+            "expires_at": time.time() + HLS_CLIENT_GRACE_SECONDS,
+            "referenced": referenced,
+        })
+
+    def _preserve_current_index_assets(self):
+        index = HLS_DIR / "index.m3u8"
+        if not index.exists():
+            return
+        self._remember_hls_assets(index)
+
+    def _preserved_hls_assets(self):
+        now_ts = time.time()
+        active_entries = deque(maxlen=self.hls_preserved_assets.maxlen)
+        referenced = set()
+        for entry in self.hls_preserved_assets:
+            if float(entry.get("expires_at") or 0) <= now_ts:
+                continue
+            active_entries.append(entry)
+            referenced.update(set(entry.get("referenced") or ()))
+        self.hls_preserved_assets = active_entries
+        return referenced
+
+    def _prune_handoff_hls(self):
+        if not HLS_DIR.exists():
+            return
+        playlist = HLS_DIR / "index.m3u8"
+        active_playlist = Path(self.active_hls_playlist or playlist)
+        referenced = self._preserved_hls_assets()
+        for current in {playlist, active_playlist}:
+            try:
+                referenced.update(self._playlist_referenced_files(current))
+            except FileNotFoundError:
+                continue
 
         segments = sorted(
             list(HLS_DIR.glob("live_*.ts")) + list(HLS_DIR.glob("live_*.m4s")),
             key=lambda p: self._hls_segment_number(p) if self._hls_segment_number(p) is not None else -1,
         )
-        keep_recent = {p.name for p in segments[-max(30, len(referenced) + 10):]}
-        keep = referenced | keep_recent | {"index.m3u8"}
+        keep_recent = {p.name for p in segments[-max(12, len(referenced) + 4):]}
+        keep = referenced | keep_recent | {"index.m3u8", active_playlist.name}
         for item in HLS_DIR.iterdir():
             if item.name in keep or item.name == "snapshots":
                 continue
@@ -1895,6 +2342,37 @@ class LiveManager:
                 item.unlink(missing_ok=True)
             elif re.match(r"^run_\d+\.m3u8$", item.name):
                 item.unlink(missing_ok=True)
+        self._prune_work_runs()
+
+    def _prune_work_runs(self):
+        if not WORK_DIR.exists():
+            return
+        active_run_dir = None
+        with self.lock:
+            jobs = list(self.current_snapshot_jobs)
+        for _kind, input_args, _source in jobs:
+            for idx, arg in enumerate(input_args):
+                if arg == "-i" and idx + 1 < len(input_args):
+                    source = str(input_args[idx + 1])
+                    if source.startswith(str(WORK_DIR)) and "run_" in source:
+                        active_run_dir = Path(source).resolve().parent
+                        break
+            if active_run_dir is not None:
+                break
+
+        cutoff = time.time() - HLS_CLIENT_GRACE_SECONDS
+        for run_dir in WORK_DIR.glob("run_*"):
+            if not run_dir.is_dir():
+                continue
+            if active_run_dir and run_dir.resolve() == active_run_dir:
+                continue
+            try:
+                mtime = run_dir.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if mtime > cutoff:
+                continue
+            shutil.rmtree(run_dir, ignore_errors=True)
 
     def _set_align_monitor_status(self, monitor, msg=None):
         if msg is not None:
@@ -1905,11 +2383,7 @@ class LiveManager:
             self.status["auto_align_monitor"] = monitor.snapshot()
 
     def _set_current_snapshot_jobs(self, pipeline, profile):
-        jobs = []
-        if pipeline.video_snapshot_input:
-            jobs.append(("video", pipeline.video_snapshot_input, self.status.get("active_channel") or "active video"))
-        if pipeline.audio_snapshot_input:
-            jobs.append(("audio", pipeline.audio_snapshot_input, profile.get("audio_channel") or "active audio"))
+        jobs = list(pipeline.snapshot_jobs or [])
         with self.lock:
             self.current_snapshot_jobs = jobs
 
@@ -1975,6 +2449,9 @@ class LiveManager:
                 }
         return result
 
+    def _read_top_quarter_clock(self, frame_path, kind=None):
+        return self._read_locked_clock(frame_path, self._scoreboard_top_quarter_roi(), kind=kind)
+
     def _roi_store(self):
         data = self.roi if isinstance(self.roi, dict) else {}
         if "channels" not in data or not isinstance(data.get("channels"), dict):
@@ -2030,7 +2507,30 @@ class LiveManager:
         py = min(max(0.0, cy - ph / 2), max(0.0, 1.0 - ph))
         return px, py, pw, ph
 
-    def _scoreboard_scan_roi(self, side="left", width=0.5, height=0.25):
+    def _scoreboard_top_half_roi(self):
+        return (0.0, 0.0, 1.0, 0.5)
+
+    def _scoreboard_top_quarter_roi(self):
+        return (0.0, 0.0, 1.0, 0.25)
+
+    def _scoreboard_top_quadrant_roi(self, side):
+        side = str(side or "").strip().lower()
+        if side in ("right", "2"):
+            return (0.5, 0.0, 0.5, 0.5)
+        if side in ("left", "1"):
+            return (0.0, 0.0, 0.5, 0.5)
+        return None
+
+    def _is_scoreboard_top_scan_roi(self, roi):
+        if not roi:
+            return False
+        return tuple(round(float(part), 3) for part in roi) in (
+            (0.0, 0.0, 1.0, 0.5),
+            (0.0, 0.0, 0.5, 0.5),
+            (0.5, 0.0, 0.5, 0.5),
+        )
+
+    def _scoreboard_scan_roi(self, side="left", width=0.5, height=0.5):
         width = min(max(width, 0.5), 1.0)
         height = min(max(height, 0.25), 1.0)
         if side == "right":
@@ -2287,43 +2787,10 @@ class LiveManager:
 
     def _monitor_alignment_from_frames(self, video_frame, audio_frame, profile, monitor):
         threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
-        required_mismatches = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=1)
         current = float(profile.get("offset_seconds", 0) or 0)
         monitor.checks += 1
-
-        if not monitor.video_roi_locked:
-            sample, source = self._resolve_monitor_roi_for_frame(video_frame, "video", profile, monitor, monitor.video_channel)
-            if sample:
-                self._lock_monitor_roi(monitor, "video", sample, profile, source)
-
-        if not monitor.audio_roi_locked:
-            sample, source = self._resolve_monitor_roi_for_frame(audio_frame, "audio", profile, monitor, monitor.audio_channel)
-            if sample:
-                self._lock_monitor_roi(monitor, "audio", sample, profile, source)
-
-        if not monitor.locked():
-            monitor.state = "acquiring"
-            missing = []
-            now_t = time.time()
-            if not monitor.video_roi_locked:
-                detail = ""
-                if monitor.video_search_started_at:
-                    remain = max(0, TIMER_ROI_SCAN_WINDOW_SECONDS - (now_t - monitor.video_search_started_at))
-                    if remain > 0:
-                        detail = f" (scan {int(remain)}s)"
-                missing.append("video" + detail)
-            if not monitor.audio_roi_locked:
-                detail = ""
-                if monitor.audio_search_started_at:
-                    remain = max(0, TIMER_ROI_SCAN_WINDOW_SECONDS - (now_t - monitor.audio_search_started_at))
-                    if remain > 0:
-                        detail = f" (scan {int(remain)}s)"
-                missing.append("audio" + detail)
-            monitor.message = "waiting for timer ROI: " + ", ".join(missing)
-            return None, monitor.message
-
-        video_sample = self._read_locked_clock(video_frame, monitor.video_roi, kind="video")
-        audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi, kind="audio")
+        video_sample = self._read_top_quarter_clock(video_frame, kind="video")
+        audio_sample = self._read_top_quarter_clock(audio_frame, kind="audio")
 
         if not video_sample or not audio_sample:
             if not video_sample:
@@ -2335,52 +2802,13 @@ class LiveManager:
             else:
                 monitor.audio_missing_count = 0
             total_missing = max(monitor.video_missing_count, monitor.audio_missing_count)
-            monitor.state = "locked"
-            if total_missing >= 3:
-                # Try to re-find ROI for sides that have been missing for 3+ checks
-                # (stay in "locked" state — could be halftime, don't go back to acquiring)
-                if monitor.video_missing_count >= 3:
-                    sample, source = self._resolve_monitor_roi_for_frame(video_frame, "video", profile, monitor, monitor.video_channel)
-                    if sample:
-                        self._lock_monitor_roi(monitor, "video", sample, profile, source)
-                        monitor.video_missing_count = 0
-                if monitor.audio_missing_count >= 3:
-                    sample, source = self._resolve_monitor_roi_for_frame(audio_frame, "audio", profile, monitor, monitor.audio_channel)
-                    if sample:
-                        self._lock_monitor_roi(monitor, "audio", sample, profile, source)
-                        monitor.audio_missing_count = 0
-                # Re-read after potential re-lock
-                if monitor.video_missing_count == 0:
-                    video_sample = self._read_locked_clock(video_frame, monitor.video_roi, kind="video")
-                if monitor.audio_missing_count == 0:
-                    audio_sample = self._read_locked_clock(audio_frame, monitor.audio_roi, kind="audio")
-                if video_sample and audio_sample:
-                    # Found both timers after re-find; proceed to alignment check
-                    monitor.video_missing_count = 0
-                    monitor.audio_missing_count = 0
-                    monitor.video_clock = video_sample.text
-                    monitor.audio_clock = audio_sample.text
-                    candidate, detail = self._candidate_offset_from_samples(video_sample, audio_sample, profile)
-                    if candidate is None:
-                        monitor.message = detail
-                        return None, monitor.message
-                    current = float(profile.get("offset_seconds", 0) or 0)
-                    delta = abs(candidate - current)
-                    if delta < profile.get("auto_align_threshold", 1.0):
-                        monitor.state = "aligned"
-                        monitor.message = f"stable current={current:.3f}s candidate={candidate:.3f}s {detail}"
-                        return None, monitor.message
-                    monitor.state = "realigning"
-                    monitor.message = f"reacquired; new offset {candidate:.3f}s {detail}"
-                    return candidate, monitor.message
-                missing = []
-                if not video_sample:
-                    missing.append("video")
-                if not audio_sample:
-                    missing.append("audio")
-                monitor.message = f"timer missing for {total_missing} checks; scanning {', '.join(missing)}"
-            else:
-                monitor.message = f"timer missing ({total_missing}/3)"
+            monitor.state = "acquiring"
+            missing = []
+            if not video_sample:
+                missing.append("video")
+            if not audio_sample:
+                missing.append("audio")
+            monitor.message = f"timer missing ({total_missing}/3): {', '.join(missing)}"
             return None, monitor.message
 
         monitor.video_missing_count = 0
@@ -2390,14 +2818,24 @@ class LiveManager:
 
         candidate = self._sample_pair_offset(video_sample, audio_sample, profile)
         if candidate is None:
-            monitor.state = "locked"
-            monitor.message = f"offset exceeds max bound ({monitor.mismatch_count}/{required_mismatches})"
+            monitor.state = "acquiring"
+            monitor.message = "offset exceeds max bound"
             return None, monitor.message
 
         delta = abs(candidate - current)
         if video_sample.game_time == audio_sample.game_time and delta >= threshold:
             monitor.state = "realigning"
             monitor.message = f"matched clocks; new offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
+            self.log(f"auto-align: {monitor.message}")
+            return candidate, monitor.message
+
+        if (
+            monitor.checks <= 2
+            and delta >= max(threshold * 3, 3.0)
+            and abs(video_sample.game_time - audio_sample.game_time) >= max(threshold * 3, 3.0)
+        ):
+            monitor.state = "realigning"
+            monitor.message = f"early mismatch; new offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
             self.log(f"auto-align: {monitor.message}")
             return candidate, monitor.message
 
@@ -2408,20 +2846,12 @@ class LiveManager:
             monitor.mismatch_count = 0
             return None, monitor.message
 
-        monitor.mismatch_offsets.append(candidate)
-        monitor.mismatch_offsets = monitor.mismatch_offsets[-required_mismatches:]
-        monitor.mismatch_count = len(monitor.mismatch_offsets)
-        stable = self._stable_mismatch_offset(monitor.mismatch_offsets)
-        if monitor.mismatch_count >= required_mismatches and stable is not None:
-            monitor.state = "realigning"
-            monitor.message = f"{monitor.mismatch_count} mismatches; new offset {stable:.3f}s v={video_sample.text} a={audio_sample.text}"
-            self.log(f"auto-align: {monitor.message}")
-            return stable, monitor.message
-
-        monitor.state = "mismatch"
-        monitor.message = f"mismatch {monitor.mismatch_count}/{required_mismatches}: current={current:.3f}s candidate={candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
+        monitor.mismatch_offsets = [candidate]
+        monitor.mismatch_count = 1
+        monitor.state = "realigning"
+        monitor.message = f"mismatch; new offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
         self.log(f"auto-align: {monitor.message}")
-        return None, monitor.message
+        return candidate, monitor.message
 
     def _monitor_alignment_once(self, video, audio, profile, monitor):
         if not audio or not audio.url:
@@ -2445,6 +2875,74 @@ class LiveManager:
                 return None, monitor.message
             return self._monitor_alignment_from_frames(video_cap.path, audio_cap.path, profile, monitor)
 
+    def _read_verify_clock(self, frame_path, kind, profile, monitor):
+        return self._read_top_quarter_clock(frame_path)
+
+    def _verify_alignment_candidate(self, video, audio, profile, monitor, candidate):
+        if not audio or not audio.url:
+            return False, "video-only; no audio clock to compare"
+        threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
+        timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        segment_seconds = effective_segment_time(profile)
+        verify_video = video
+        verify_audio = audio
+        verify_proc = None
+        verify_dir = None
+        previous_stage = ""
+        with self.lock:
+            previous_stage = self.status.get("stage", "")
+        try:
+            if candidate >= 0.5:
+                verify_dir = Path(tempfile.mkdtemp(prefix="align_verify_"))
+                verify_playlist = verify_dir / "video_delay.m3u8"
+                list_size = max(20, int(candidate / segment_seconds) + 20)
+                video_codec = self._probe_video_codec(video, timeout)
+                verify_proc = self._start_delay_recorder(video, verify_playlist, f"{segment_seconds:.3f}", list_size, timeout, "video", video_codec)
+                try:
+                    self._buffer_delay_input(verify_proc, verify_playlist, candidate, timeout, "verifying video")
+                finally:
+                    with self.lock:
+                        if self.status.get("stage", "").startswith("verifying "):
+                            self.status["stage"] = previous_stage or "running"
+                verify_video = Channel(name=video.name, url=str(verify_playlist))
+            elif candidate <= -0.5:
+                verify_dir = Path(tempfile.mkdtemp(prefix="align_verify_"))
+                verify_playlist = verify_dir / "audio_delay.m3u8"
+                list_size = max(20, int(abs(candidate) / segment_seconds) + 20)
+                audio_stream_index, _audio_codec = self._select_audio_stream(audio, timeout)
+                verify_proc = self._start_delay_recorder(audio, verify_playlist, f"{segment_seconds:.3f}", list_size, timeout, "audio", audio_stream_index=audio_stream_index)
+                try:
+                    self._buffer_delay_input(verify_proc, verify_playlist, candidate, timeout, "verifying audio")
+                finally:
+                    with self.lock:
+                        if self.status.get("stage", "").startswith("verifying "):
+                            self.status["stage"] = previous_stage or "running"
+                verify_audio = Channel(name=audio.name, url=str(verify_playlist))
+
+            with tempfile.TemporaryDirectory(prefix="align_verify_frame_") as tmp:
+                tmpdir = Path(tmp)
+                try:
+                    video_cap, audio_cap = self._capture_frame_pair(verify_video, verify_audio, tmpdir, timeout)
+                except Exception as exc:
+                    return False, f"verify capture failed: {exc}"
+                if self._pair_capture_skew(video_cap, audio_cap) > 0.75 or abs(video_cap.finished_at - audio_cap.finished_at) > 1.0:
+                    return False, "verify capture skew too large"
+                video_sample = self._read_verify_clock(video_cap.path, "video", profile, monitor)
+                audio_sample = self._read_verify_clock(audio_cap.path, "audio", profile, monitor)
+                if not video_sample or not audio_sample:
+                    return False, "verify OCR failed"
+                delta = abs(video_sample.game_time - audio_sample.game_time)
+                if delta <= threshold:
+                    return True, f"verified offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
+                return False, f"verify mismatch {delta:.1f}s v={video_sample.text} a={audio_sample.text}"
+        finally:
+            self._stop_processes([verify_proc] if verify_proc else [])
+            if verify_dir:
+                shutil.rmtree(verify_dir, ignore_errors=True)
+            with self.lock:
+                if self.status.get("stage", "").startswith("verifying "):
+                    self.status["stage"] = previous_stage or "running"
+
     def _refresh_runtime_auto_align_profile(self, profile):
         with self.lock:
             latest = self.profile.copy()
@@ -2453,17 +2951,22 @@ class LiveManager:
                 profile[key] = latest[key]
         return profile
 
-    def _run_pipeline(self, video, audio, profile):
+    def _run_pipeline(self, video, audio, profile, preserve_hls=False):
         video_url = video.url
         audio_url = audio.url if audio else ""
         self._stop_processes()
-        self._clear_hls()
+        preserve_hls = preserve_hls or self._should_preserve_hls()
+        if preserve_hls:
+            self._preserve_current_index_assets()
+        if not preserve_hls:
+            self._clear_hls()
         WORK_DIR.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(WORK_DIR, ignore_errors=True)
         WORK_DIR.mkdir(parents=True, exist_ok=True)
 
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
         stall_timeout = hls_stall_timeout(profile)
+        startup_timeout = startup_hls_wait_timeout(profile)
         segment_seconds = effective_segment_time(profile)
         source_cache = None
         pipeline_video = video
@@ -2474,37 +2977,67 @@ class LiveManager:
                 pipeline_video = source_cache.video
                 pipeline_audio = source_cache.audio
             except Exception as exc:
-                return f"local source cache failed: {exc}"
+                text = str(exc).lower()
+                kind = "audio" if "audio cache" in text else "video" if "video cache" in text else "unknown"
+                return PipelineFailure(f"local source cache failed: {exc}", kind=kind)
         run_id = 0
         try:
             current_pipeline = self._prepare_pipeline(pipeline_video, pipeline_audio, profile, f"run_{run_id:03d}", source_cache=source_cache)
         except Exception as exc:
             return str(exc)
         self._set_current_snapshot_jobs(current_pipeline, profile)
-        mux = self._start_mux(current_pipeline, profile, start_number=0)
+        playlist_path = HLS_DIR / "index.m3u8"
+        start_number = self._next_hls_start_number() if preserve_hls else 0
+        self.active_hls_playlist = playlist_path
+        if preserve_hls and (HLS_DIR / "index.m3u8").exists():
+            start_number = self._reserve_handoff_start_number(profile)
+            playlist_path = HLS_DIR / f"run_{start_number:06d}.m3u8"
+            playlist_path.unlink(missing_ok=True)
+        mux = self._start_mux(current_pipeline, profile, start_number=start_number, playlist_path=playlist_path, discontinuity=preserve_hls)
+        if playlist_path.name != "index.m3u8":
+            try:
+                self._wait_for_handoff_segment(
+                    playlist_path,
+                    mux,
+                    max(stall_timeout, 45),
+                    min(3, coerce_int(profile.get("playlist_size"), DEFAULT_PROFILE["playlist_size"], minimum=3)),
+                )
+                self.log(f"handoff: publishing warmed startup playlist {playlist_path.name}")
+                self._publish_hls_playlist(playlist_path)
+            except Exception as exc:
+                self._stop_processes([mux, *current_pipeline.delay_procs])
+                shutil.rmtree(current_pipeline.run_dir, ignore_errors=True)
+                playlist_path.unlink(missing_ok=True)
+                return self._classify_stall_failure(source_cache, f"warmup failed: {exc}")
 
-        first_segment_deadline = time.time() + stall_timeout
+        first_segment_deadline = time.time() + startup_timeout
         last_snapshot_check = 0.0
+        last_runtime_prune_check = 0.0
         auto_align_profile = profile.copy()
         align_monitor = AlignmentMonitor()
         align_monitor.video_channel = video.name if video else ""
         align_monitor.audio_channel = audio.name if audio and audio.url else ""
         align_monitor.video_channel_key = self._channel_roi_key("video", video)
         align_monitor.audio_channel_key = self._channel_roi_key("audio", audio) if audio and audio.url else ""
-        try:
-            align_monitor.video_roi = parse_roi(auto_align_profile.get("video_roi", DEFAULT_PROFILE["video_roi"]))
-            align_monitor.audio_roi = parse_roi(auto_align_profile.get("audio_roi", DEFAULT_PROFILE["audio_roi"]))
-            align_monitor.state = "acquiring"
-            align_monitor.message = "trying configured timer ROI"
-        except ValueError:
-            align_monitor.state = "acquiring"
-            align_monitor.message = "waiting for timer ROI"
+        align_monitor.state = "acquiring"
+        align_monitor.message = "reading timer from top quarter"
         with self.lock:
             self.status["auto_align_state"] = align_monitor.state
             self.status["auto_align_msg"] = align_monitor.message
             self.status["auto_align_monitor"] = align_monitor.snapshot()
         while not self.stop_event.is_set():
             auto_align_profile = self._refresh_runtime_auto_align_profile(auto_align_profile)
+            cache_failure = self._source_cache_failure(source_cache)
+            if cache_failure:
+                return cache_failure
+            if Path(self.active_hls_playlist or (HLS_DIR / "index.m3u8")).name != "index.m3u8":
+                try:
+                    self._sync_active_hls_playlist()
+                except Exception as exc:
+                    return PipelineFailure(f"failed to refresh index playlist from {Path(self.active_hls_playlist).name}: {exc}")
+            if time.time() - last_runtime_prune_check >= 30:
+                last_runtime_prune_check = time.time()
+                self._prune_handoff_hls()
             if mux.poll() is not None:
                 return f"ffmpeg exited with code {mux.returncode}{self._mux_failure_detail(mux, current_pipeline)}"
             mtime = self._latest_hls_mtime()
@@ -2514,17 +3047,19 @@ class LiveManager:
                     self.status["stage"] = "running"
                 if time.time() - mtime > stall_timeout:
                     age = time.time() - mtime
-                    return (
+                    detail = (
                         f"no new HLS segment for {stall_timeout}s "
                         f"(last segment {age:.1f}s ago, input timeout {timeout}s, segment {segment_seconds:.3f}s)"
                         f"{self._mux_failure_detail(mux, current_pipeline)}"
                     )
+                    return self._source_cache_stall_failure(source_cache, stall_timeout) or self._classify_stall_failure(source_cache, detail)
             elif time.time() > first_segment_deadline:
-                return (
-                    f"no HLS segment created within {stall_timeout}s "
+                detail = (
+                    f"no HLS segment created within {startup_timeout}s "
                     f"(input timeout {timeout}s, segment {segment_seconds:.3f}s)"
                     f"{self._mux_failure_detail(mux, current_pipeline)}"
                 )
+                return self._source_cache_stall_failure(source_cache, stall_timeout) or self._classify_stall_failure(source_cache, detail)
             cycle_interval = coerce_float(auto_align_profile.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"], minimum=5)
             align_allowed_now = self._auto_align_allowed_by_schedule(auto_align_profile)
             if not align_allowed_now and align_monitor.state != "disabled":
@@ -2540,9 +3075,9 @@ class LiveManager:
             if align_monitor.state == "aligned":
                 probe_interval = max(cycle_interval * 5, 300)
             elif align_monitor.locked():
-                probe_interval = max(cycle_interval // 2, 15)
+                probe_interval = max(cycle_interval, TIMER_ROI_SCAN_INTERVAL_SECONDS)
             else:
-                probe_interval = TIMER_ROI_SCAN_INTERVAL_SECONDS
+                probe_interval = max(cycle_interval, TIMER_ROI_SCAN_INTERVAL_SECONDS)
             if align_allowed_now and time.time() - last_snapshot_check >= probe_interval and mtime:
                 last_snapshot_check = time.time()
                 frames = {}
@@ -2555,17 +3090,22 @@ class LiveManager:
                             align_monitor.state = "disabled"
                             a_msg = "video-only; no audio clock to compare"
                             new_off = None
-                        elif "video" not in frames or "audio" not in frames:
-                            align_monitor.state = "capture_failed"
-                            detail = "; ".join(f"{kind}: {msg}" for kind, msg in errors.items()) or "missing snapshot frame"
-                            a_msg = f"frame capture failed: {detail}"
-                            self.log(f"auto-align: {a_msg}; keeping current offset")
-                            new_off = None
                         else:
-                            new_off, a_msg = self._monitor_alignment_from_frames(
-                                frames["video"][0], frames["audio"][0], auto_align_profile, align_monitor
+                            new_off, a_msg = self._monitor_alignment_once(
+                                pipeline_video, pipeline_audio, auto_align_profile, align_monitor
                             )
                         if new_off is not None:
+                            align_monitor.state = "verifying"
+                            self._set_align_monitor_status(align_monitor, f"{a_msg}; verifying candidate {new_off:.3f}s")
+                            verified, verify_msg = self._verify_alignment_candidate(
+                                pipeline_video, pipeline_audio, auto_align_profile, align_monitor, new_off
+                            )
+                            if not verified:
+                                a_msg = f"{a_msg}; {verify_msg}; keeping current offset"
+                                self.log(f"auto-align: {a_msg}")
+                                self._set_align_monitor_status(align_monitor, a_msg)
+                                continue
+                            a_msg = f"{a_msg}; {verify_msg}"
                             next_profile = auto_align_profile.copy()
                             next_profile["offset_seconds"] = new_off
                             try:
@@ -2608,6 +3148,12 @@ class LiveManager:
             except FileNotFoundError:
                 pass
         return max(mtimes) if mtimes else 0
+
+    def _should_preserve_hls(self):
+        latest = self._latest_hls_mtime()
+        if not latest:
+            return False
+        return time.time() - latest <= HLS_RECOVERY_WINDOW_SECONDS
 
     # ── Match schedule automation ───────────────────────────────────
 
@@ -2768,6 +3314,8 @@ class LiveManager:
         }
 
     def _auto_align_allowed_by_schedule(self, profile):
+        if parse_bool(profile.get("auto_align_debug_override", DEFAULT_PROFILE.get("auto_align_debug_override", False))):
+            return True
         if not parse_bool(profile.get("schedule_enabled", DEFAULT_PROFILE.get("schedule_enabled", True))):
             return True
         with self.lock:
@@ -3165,56 +3713,200 @@ class LiveManager:
         return buf if ok else None
 
     def _parse_ocr_text_candidates(self, raw_text):
-        parsed = self._parse_clock_text(raw_text)
+        text = str(raw_text or "").strip()
+        if not text:
+            return None
+        if self._ocr_reply_says_no_scoreboard(text):
+            return None
+        if not self._ocr_reply_has_scoreboard_features(text):
+            return None
+        parsed = self._parse_clock_text(text)
         if parsed:
             return parsed
-        lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
         for line in lines:
+            if self._ocr_reply_says_no_scoreboard(line):
+                continue
             parsed = self._parse_clock_text(line)
             if parsed:
                 return parsed
         return None
 
+    def _ocr_reply_says_no_scoreboard(self, text):
+        normalized = re.sub(r"[^a-z]+", "", str(text or "").strip().lower())
+        return normalized in {
+            "none",
+            "null",
+            "empty",
+            "unknown",
+            "noscoreboard",
+            "nosoccerscoreboard",
+            "nofootballscoreboard",
+            "nobroadcastscoreboard",
+            "notimer",
+        }
+
+    def _ocr_reply_has_scoreboard_features(self, text):
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        compact = re.sub(r"\s+", " ", raw)
+        score_pair = None
+        for match in re.finditer(r"(?<!\d)(\d{1,2})\s*[-:]\s*(\d{1,2})(?!\d)", compact):
+            left = int(match.group(1))
+            right = int(match.group(2))
+            if left <= 20 and right <= 20:
+                score_pair = match
+                break
+        team_blocks = re.findall(r"\b[A-Z]{2,4}\b", compact)
+        versus = re.search(r"\b[A-Z][A-Za-z]{1,12}\s+(?:v|vs|VS)\.?\s+[A-Z][A-Za-z]{1,12}\b", compact)
+        has_time = False
+        for line in [compact, *[line.strip() for line in compact.splitlines() if line.strip()]]:
+            if self._parse_clock_text(line):
+                has_time = True
+                break
+        has_score = score_pair is not None
+        has_team_like = len(team_blocks) >= 2 or versus is not None
+        return has_time and (has_score or has_team_like)
+
+    def _is_stoppage_base_clock_text(self, text):
+        parsed = self._parse_clock_text(text)
+        if not parsed or parsed.kind != "clock":
+            return False
+        mins = int(parsed.game_time // 60)
+        secs = int(parsed.game_time % 60)
+        return mins in ADJACENT_STOPPAGE_BASES and secs <= 5
+
+    def _expand_roi(self, roi, *, width_scale=1.0, height_scale=1.0, shift_x=0.0, shift_y=0.0):
+        x, y, w, h = parse_roi(",".join(str(part) for part in roi)) if isinstance(roi, (list, tuple)) else parse_roi(roi)
+        cx = x + w / 2 + shift_x * w
+        cy = y + h / 2 + shift_y * h
+        new_w = min(1.0, w * width_scale)
+        new_h = min(1.0, h * height_scale)
+        new_x = min(max(0.0, cx - new_w / 2), max(0.0, 1.0 - new_w))
+        new_y = min(max(0.0, cy - new_h / 2), max(0.0, 1.0 - new_h))
+        return (new_x, new_y, new_w, new_h)
+
+    def _stoppage_retry_rois(self, roi):
+        base = parse_roi(",".join(str(part) for part in roi)) if isinstance(roi, (list, tuple)) else parse_roi(roi)
+        side_shift = 0.8 if base[0] < 0.5 else -0.8
+        candidates = [
+            self._expand_roi(base, width_scale=2.8, height_scale=1.8),
+            self._expand_roi(base, width_scale=3.6, height_scale=2.2, shift_x=side_shift),
+            self._timer_preview_roi(base),
+        ]
+        return self._dedupe_rois(candidates)
+
+    def _retry_stoppage_with_expanded_roi(self, provider, frame_path, roi, profile):
+        for candidate_roi in self._stoppage_retry_rois(roi):
+            result = self._ocr_region_with_provider(provider, frame_path, candidate_roi, profile)
+            if not result:
+                continue
+            parsed = self._parse_ocr_text_candidates(result[1])
+            if parsed and parsed.kind == "stoppage":
+                return parsed.game_time, parsed.text
+        return None
+
     def _custom_ocr_prompt(self):
         return (
-            "Read the football match timer in this image. Return ONLY the timer text exactly as shown. "
-            "If the image shows a base time and a separate stoppage elapsed timer, include both, for example 45:00 0:32+4. "
-            "If added time appears, include it in the same string, for example 90:00+02:30 or 4:32+8. "
-            "Examples: 90:00, 45:00+02:30, 45:00 0:32+4, 90:00 4:32 mins.+8. No explanation."
+            "First decide whether this image contains a football or soccer live-match scoreboard with a match timer. "
+            "If there is no football or soccer scoreboard/timer, return ONLY NO_SCOREBOARD. "
+            "If it is not a live football scoreboard, return ONLY NO_SCOREBOARD. "
+            "Only accept it if the same scoreboard also shows team names/abbreviations or a score such as 0-0, 1:0, ENG, BRA. "
+            "If the timer is visible but there are no team names and no score, return ONLY NO_SCOREBOARD. "
+            "Otherwise return ONLY the raw scoreboard text that contains the timer together with the team/score context. "
+            "Examples: ENG 0-0 BRA 45:00, ARS CHE 90:00+02:30, LIV 1-0 MCI 45:00 0:32+4. No explanation."
         )
 
-    def _send_custom_ocr_crop(self, crop_img, endpoint, api_key, model):
+    def _custom_scoreboard_side_prompt(self):
+        return (
+            "This image is the top half of a football broadcast frame split into two equal vertical areas. "
+            "Return ONLY 1 if the scoreboard/timer graphic is in the left half. "
+            "Return ONLY 2 if it is in the right half. "
+            "Return ONLY unknown if no scoreboard/timer graphic is visible."
+        )
+
+    def _send_custom_ocr_crop(self, crop_img, endpoint, api_key, model, prompt=None):
         import cv2 as _cv2, base64, json as _json, urllib.request
         if crop_img is None or crop_img.size == 0:
             return None
         _, buf = _cv2.imencode(".jpg", crop_img, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
         b64 = base64.b64encode(buf).decode("utf-8")
         self._record_ocr_request("custom")
-        data = _json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": self._custom_ocr_prompt()},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}
-            ],
-            "max_tokens": 50
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"{endpoint}/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}", "User-Agent": "live-sync-ocr/1.0"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = _json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
-            self.log(f"Custom OCR API error: {exc}")
-            return None
+        prompt_text = prompt or self._custom_ocr_prompt()
+        request_specs = [
+            (
+                f"{endpoint}/responses",
+                {
+                    "model": model,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt_text},
+                                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
+                            ],
+                        }
+                    ],
+                    "max_output_tokens": 50,
+                },
+            ),
+            (
+                f"{endpoint}/chat/completions",
+                {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            ],
+                        }
+                    ],
+                    "max_tokens": 50,
+                },
+            ),
+        ]
+        last_exc = None
+        for url, payload in request_specs:
+            req = urllib.request.Request(
+                url,
+                data=_json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}", "User-Agent": "live-sync-ocr/1.0"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = _json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:
+                last_exc = exc
+                continue
+            reply = self._extract_custom_ocr_text(result)
+            if reply:
+                return reply
+        if last_exc is not None:
+            self.log(f"Custom OCR API error: {last_exc}")
+        return None
+
+    def _extract_custom_ocr_text(self, result):
+        if not isinstance(result, dict):
+            return ""
+        output_text = str(result.get("output_text") or "").strip()
+        if output_text:
+            return output_text
+        output = result.get("output") or []
+        for item in output:
+            for content in item.get("content") or []:
+                if content.get("type") in ("output_text", "text"):
+                    text = str(content.get("text") or "").strip()
+                    if text:
+                        return text
         choices = result.get("choices") or []
-        if not choices:
-            return None
-        return (choices[0].get("message") or {}).get("content", "").strip()
+        for choice in choices:
+            text = str((choice.get("message") or {}).get("content") or "").strip()
+            if text:
+                return text
+        return ""
 
     def _record_ocr_request(self, provider):
         with self.lock:
@@ -3224,9 +3916,39 @@ class LiveManager:
 
     def _log_ocr_provider_failure(self, provider):
         if provider == "ocrspace":
+            self.ocr_provider_cooldowns[provider] = time.time() + OCR_FALLBACK_COOLDOWN_SECONDS
             self.log("OCR.space failed")
         elif provider == "custom":
             self.log("Custom OCR API failed")
+
+    def _scoreboard_side_from_ocrspace_ratio(self, left_ratio):
+        if left_ratio is None:
+            return None
+        try:
+            ratio = float(left_ratio)
+        except (TypeError, ValueError):
+            return None
+        if ratio < 0.5:
+            return "left"
+        if ratio >= 0.5:
+            return "right"
+        return None
+
+    def _scoreboard_side_from_custom_reply(self, reply):
+        normalized = re.sub(r"[^0-9a-z]+", "", str(reply or "").strip().lower())
+        if normalized in ("1", "left"):
+            return "left"
+        if normalized in ("2", "right"):
+            return "right"
+        return None
+
+    def _detect_scoreboard_side_via_custom(self, img, endpoint, api_key, model):
+        roi = self._scoreboard_top_half_roi()
+        h, w = img.shape[:2]
+        x, y, rw, rh = roi
+        crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
+        reply = self._send_custom_ocr_crop(crop, endpoint, api_key, model, prompt=self._custom_scoreboard_side_prompt())
+        return self._scoreboard_side_from_custom_reply(reply)
 
     def _ocr_time(self, frame_path, roi, scale=6):
         profile = self.get_profile()
@@ -3236,11 +3958,23 @@ class LiveManager:
         for idx, provider in enumerate(providers):
             if idx > 0 and not ocr_provider_ready_for(provider, profile):
                 continue
+            cooldown_until = float(self.ocr_provider_cooldowns.get(provider, 0) or 0)
+            if idx > 0 and cooldown_until > time.time():
+                continue
             if idx > 0:
                 self.log(f"OCR primary '{providers[0]}' failed, ROI fallback to '{provider}'")
             result = self._ocr_region_with_provider(provider, frame_path, roi, profile)
             if result:
-                return result
+                parsed_text = self._parse_ocr_text_candidates(result[1])
+                if not parsed_text:
+                    self._log_ocr_provider_failure(provider)
+                    continue
+                normalized_result = (parsed_text.game_time, parsed_text.text)
+                if self._is_stoppage_base_clock_text(normalized_result[1]):
+                    retried = self._retry_stoppage_with_expanded_roi(provider, frame_path, roi, profile)
+                    if retried:
+                        return retried
+                return normalized_result
             self._log_ocr_provider_failure(provider)
         return None
 
@@ -3304,10 +4038,33 @@ class LiveManager:
         left_ratio = None
         overlay = parsed_items[0].get("TextOverlay") or {}
         lines = overlay.get("Lines") or []
-        if lines and lines[0].get("Words"):
-            img_w = float(overlay.get("ImageWidth", 1) or 1)
-            word = lines[0]["Words"][0]
-            left_ratio = float(word.get("Left", 0)) / max(img_w, 1)
+        img_w = float(overlay.get("ImageWidth", 1) or 1)
+
+        def line_center_ratio(words):
+            boxes = []
+            for word in words or []:
+                try:
+                    left = float(word.get("Left", 0) or 0)
+                    width = float(word.get("Width", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                boxes.append((left, left + width))
+            if not boxes:
+                return None
+            return ((min(item[0] for item in boxes) + max(item[1] for item in boxes)) / 2) / max(img_w, 1)
+
+        fallback_ratio = None
+        for line in lines:
+            words = line.get("Words") or []
+            ratio = line_center_ratio(words)
+            if ratio is not None and fallback_ratio is None:
+                fallback_ratio = ratio
+            line_text = " ".join(str(word.get("WordText", "")).strip() for word in words).strip()
+            if ratio is not None and self._parse_ocr_text_candidates(line_text):
+                left_ratio = ratio
+                break
+        if left_ratio is None:
+            left_ratio = fallback_ratio
         return parsed_text, left_ratio
 
     def _ocr_via_ocrspace(self, frame_path, roi, profile):
@@ -3332,33 +4089,24 @@ class LiveManager:
         return None
 
     def _find_clock_via_ocrspace(self, frame_path, profile):
-        """Smart scan: send top half, then fallback to wider crops when needed."""
+        """Read the timer only from the top quarter of the frame."""
         api_key = coerce_text(profile.get("ocrspace_api_key", "")).strip()
         if not api_key:
             return None
         img = cv2.imread(str(frame_path))
         if img is None:
             return None
-        candidate_rois = [
-            (0.0, 0.0, 1.0, 0.5),
-            self._scoreboard_scan_roi("left"),
-            self._scoreboard_scan_roi("center"),
-            self._scoreboard_scan_roi("right"),
-            self._scoreboard_scan_roi("left", height=0.35),
-            self._scoreboard_scan_roi("right", height=0.35),
-            (0.0, 0.0, 1.0, 1.0),
-        ]
-        for roi in self._dedupe_rois(candidate_rois):
-            buf = self._prepare_ocrspace_crop(img, roi)
-            if buf is None:
-                continue
-            result = self._ocr_send_ocrspace_jpeg(buf, api_key)
-            if result is None:
-                continue
-            raw_text, _left_ratio = result
-            parsed = self._parse_ocr_text_candidates(raw_text)
-            if parsed:
-                return parsed.game_time, parsed.text, roi
+        top_quarter_roi = self._scoreboard_top_quarter_roi()
+        buf = self._prepare_ocrspace_crop(img, top_quarter_roi)
+        if buf is None:
+            return None
+        result = self._ocr_send_ocrspace_jpeg(buf, api_key)
+        if result is None:
+            return None
+        raw_text, _left_ratio = result
+        parsed = self._parse_ocr_text_candidates(raw_text)
+        if parsed:
+            return parsed.game_time, parsed.text, top_quarter_roi
         return None
 
     def _ocr_via_custom(self, frame_path, roi, profile):
@@ -3434,9 +4182,7 @@ class LiveManager:
             tmp_path.unlink(missing_ok=True)
 
     def _find_clock_via_custom(self, frame_path, profile):
-        """Smart progressive scan using custom OpenAI-compatible API.
-        Sends top half, then center quarter based on position.
-        Returns (game_time, text, roi) or None."""
+        """Read the timer only from the top quarter of the frame."""
         endpoint = coerce_text(profile.get("ocr_custom_endpoint", "")).strip().rstrip("/")
         api_key = coerce_text(profile.get("ocr_api_key", "")).strip()
         model = coerce_text(profile.get("ocr_custom_model", DEFAULT_PROFILE.get("ocr_custom_model", "gpt-4o"))).strip()
@@ -3460,21 +4206,10 @@ class LiveManager:
             if not reply:
                 return None
             return self._parse_ocr_text_candidates(reply)
-
-        candidate_rois = [
-            (0.0, 0.0, 1.0, 0.5),
-            self._scoreboard_scan_roi("left"),
-            self._scoreboard_scan_roi("center"),
-            self._scoreboard_scan_roi("right"),
-            self._scoreboard_scan_roi("left", height=0.35),
-            self._scoreboard_scan_roi("right", height=0.35),
-            (0.0, 0.0, 1.0, 1.0),
-        ]
-        for roi in self._dedupe_rois(candidate_rois):
-            parsed_roi = _parse_roi(roi)
-            if parsed_roi:
-                return parsed_roi.game_time, parsed_roi.text, roi
-
+        top_quarter_roi = self._scoreboard_top_quarter_roi()
+        parsed_roi = _parse_roi(top_quarter_roi)
+        if parsed_roi:
+            return parsed_roi.game_time, parsed_roi.text, top_quarter_roi
         return None
 
 
@@ -3502,6 +4237,8 @@ class LiveManager:
         x, y, w, h = roi
         if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > 1.001 or y + h > 1.001:
             return False
+        if self._is_scoreboard_top_scan_roi(roi):
+            return True
         if w < 0.012 or h < 0.010:
             return False
         if w > 0.24 or h > 0.20 or w * h > 0.035:
@@ -3653,23 +4390,7 @@ class LiveManager:
         self.log("auto-align: saved detected ROI " + " ".join(f"{k}={v}" for k, v in updates.items()))
 
     def _save_monitor_rois(self, profile, monitor):
-        updates = {}
-        if monitor.video_roi_locked and monitor.video_roi:
-            formatted = self._format_roi_value(monitor.video_roi)
-            if formatted != str(profile.get("video_roi", "")):
-                updates["video_roi"] = formatted
-        if monitor.audio_roi_locked and monitor.audio_roi:
-            formatted = self._format_roi_value(monitor.audio_roi)
-            if formatted != str(profile.get("audio_roi", "")):
-                updates["audio_roi"] = formatted
-        if not updates:
-            return
-        with self.lock:
-            self.profile.update(updates)
-            profile.update(updates)
-            saved = self.profile.copy()
-        json_save(PROFILE_PATH, _strip_url_fields(saved))
-        self.log("auto-align: saved locked ROI " + " ".join(f"{k}={v}" for k, v in updates.items()))
+        return
 
     def _estimate_clock_offset(self, video_samples, audio_samples, profile):
         requested_samples = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"])
@@ -3783,42 +4504,33 @@ class LiveManager:
 
         return None, f"stable ({offset:.3f}s)"
     def _snapshot_roi_for_kind(self, profile, kind):
-        roi_key = "audio_roi" if kind == "audio" else "video_roi"
-        return parse_roi(profile.get(roi_key, DEFAULT_PROFILE[roi_key]))
+        return self._scoreboard_top_quarter_roi()
 
     def _save_snapshot_from_frame(self, frame_path, kind, profile, source_name):
         with self.snapshot_file_lock:
             SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
             roi = self._snapshot_roi_for_kind(profile, kind)
             parsed = self._ocr_time(frame_path, roi)
-            found_roi = None
-            if not parsed:
-                preset_sample = self._read_preset_clock(frame_path, profile, kind)
-                if preset_sample:
-                    parsed = (preset_sample.game_time, preset_sample.text)
-                    found_roi = preset_sample.roi
-            if not parsed:
-                found = self._find_frame_clock(frame_path, full_frame=True, profile=profile)
-                if found and found.roi and self._roi_center_distance(found.roi, roi) <= 0.18:
-                    parsed = (found.game_time, found.text)
-                    found_roi = found.roi
             suffix = "timer" if parsed else "full"
             out = SNAPSHOT_DIR / f"{kind}_snapshot.jpg"
             tmp_out = SNAPSHOT_DIR / f".{kind}_snapshot.tmp.jpg"
-            if parsed:
-                crop = self._roi_crop(frame_path, self._timer_preview_roi(found_roi or roi))
-                if crop is not None:
-                    cv2.imwrite(str(tmp_out), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                else:
-                    shutil.copyfile(frame_path, tmp_out)
-                    suffix = "full"
+            crop = self._roi_crop(frame_path, roi)
+            if crop is not None:
+                cv2.imwrite(str(tmp_out), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             else:
                 shutil.copyfile(frame_path, tmp_out)
+                suffix = "full"
 
             os.replace(tmp_out, out)
             self._prune_snapshots()
             with self.lock:
                 self.status["last_snapshot_at"] = now()
+                self.status.setdefault("last_ocr_results", {})[kind] = {
+                    "clock": parsed[1] if parsed else None,
+                    "game_time": parsed[0] if parsed else None,
+                    "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                    "error": "" if parsed else "OCR failed",
+                }
             detail = parsed[1] if parsed else "full frame"
             self.log(f"captured {kind} {suffix} snapshot: {out.name} ({detail})")
             return {"kind": kind, "url": f"/snapshots/{out.name}", "source": source_name, "mode": suffix, "clock": parsed[1] if parsed else ""}
@@ -3856,7 +4568,7 @@ class LiveManager:
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
         jobs = [("video", self._direct_input(video.url, timeout, video.headers), self.status.get("active_channel") or "active video")]
         if audio and audio.url:
-            jobs.append(("audio", self._direct_input(audio.url, timeout, audio.headers), profile.get("audio_channel") or "active audio"))
+            jobs.append(("audio", self._direct_input(audio.url, timeout, audio.headers), self.status.get("active_audio_channel") or profile.get("audio_channel") or "active audio"))
         return jobs
 
     def _capture_snapshot_frames(self, jobs, profile):
@@ -3882,7 +4594,7 @@ class LiveManager:
     def _save_snapshot_frames(self, frames, profile):
         results = {}
         errors = {}
-        for kind in ("video", "audio"):
+        for kind in SNAPSHOT_KINDS:
             if kind not in frames:
                 continue
             frame_path, source_name = frames[kind]
@@ -3918,7 +4630,7 @@ class LiveManager:
             self.snapshot_lock.release()
 
     def _prune_snapshots(self):
-        keep = {"video_snapshot.jpg", "audio_snapshot.jpg"}
+        keep = {f"{kind}_snapshot.jpg" for kind in SNAPSHOT_KINDS}
         for item in SNAPSHOT_DIR.glob("*.jpg"):
             if item.name not in keep:
                 item.unlink(missing_ok=True)
@@ -3928,7 +4640,23 @@ class LiveManager:
             sources = m3u_sources(profile.get("audio_playlist", ""), profile.get("audio_local_m3u", ""), "本地音频 M3U")
             if not sources:
                 raise RuntimeError("no audio M3U configured")
-            return self.resolver.find_any_sources(sources, profile["audio_channel"], force=force)
+            with self.lock:
+                active_audio = self.status.get("active_audio_channel") or profile.get("audio_channel")
+            channels = []
+            if active_audio:
+                channels.append(active_audio)
+            for channel in selected_audio_channels(profile):
+                if channel not in channels:
+                    channels.append(channel)
+            last_exc = None
+            for channel in channels:
+                try:
+                    return self.resolver.find_any_sources(sources, channel, force=force)
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("audio channel name is empty (audio playlist is set but audio_channel field is blank)")
 
         with self.lock:
             active = self.status.get("active_channel") or profile.get("video_primary")
@@ -3947,16 +4675,23 @@ class LiveManager:
             if not jobs:
                 jobs = []
                 timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-                for kind in ("video", "audio"):
-                    channel = self._resolve_snapshot_channel(kind, profile, force=True)
-                    jobs.append((kind, self._direct_input(channel.url, timeout, channel.headers), channel.name))
+                video_channel = self._resolve_snapshot_channel("video", profile, force=True)
+                jobs.append(("cache_video", self._direct_input(video_channel.url, timeout, video_channel.headers), f"{video_channel.name} 原始"))
+                jobs.append(("video", self._direct_input(video_channel.url, timeout, video_channel.headers), f"{video_channel.name} 延迟后"))
+                try:
+                    audio_channel = self._resolve_snapshot_channel("audio", profile, force=True)
+                except Exception:
+                    audio_channel = None
+                if audio_channel and audio_channel.url:
+                    jobs.append(("cache_audio", self._direct_input(audio_channel.url, timeout, audio_channel.headers), f"{audio_channel.name} 原始"))
+                    jobs.append(("audio", self._direct_input(audio_channel.url, timeout, audio_channel.headers), f"{audio_channel.name} 延迟后"))
             results, errors = self._capture_snapshot_jobs(jobs, profile)
         finally:
             self.snapshot_lock.release()
         if errors and not results:
             raise RuntimeError("; ".join(f"{kind}: {msg}" for kind, msg in errors.items()))
         return {
-            "snapshots": [results[kind] for kind in ("video", "audio") if kind in results],
+            "snapshots": [results[kind] for kind in SNAPSHOT_KINDS if kind in results],
             "errors": errors,
         }
 
@@ -4017,7 +4752,7 @@ class LiveManager:
         return ".m4s" if segment_type == "fmp4" else ".ts"
 
     def _current_live_segment_type(self):
-        playlist = HLS_DIR / "index.m3u8"
+        playlist = self._current_served_hls_playlist()
         try:
             text = playlist.read_text(encoding="utf-8", errors="replace")
             if "#EXT-X-MAP" in text or ".m4s" in text:
@@ -4044,7 +4779,7 @@ class LiveManager:
     def _recording_sync_source(self, session, seen):
         session_dir = self._recording_dir(session.session_id)
         copied = 0
-        source_playlist = HLS_DIR / "index.m3u8"
+        source_playlist = self._current_served_hls_playlist()
         if not source_playlist.exists():
             return 0
 
@@ -4052,14 +4787,15 @@ class LiveManager:
             playlist_stat = source_playlist.stat()
         except FileNotFoundError:
             return 0
-        playlist_key = ("index.m3u8", playlist_stat.st_mtime_ns, playlist_stat.st_size)
-        if seen.get("index.m3u8") != playlist_key[1:]:
+        playlist_name = source_playlist.name
+        playlist_key = (playlist_name, playlist_stat.st_mtime_ns, playlist_stat.st_size)
+        if seen.get(playlist_name) != playlist_key[1:]:
             self._recording_copy_file(source_playlist, self._recording_playlist_path(session.session_id))
-            seen["index.m3u8"] = playlist_key[1:]
+            seen[playlist_name] = playlist_key[1:]
             copied += 1
 
         for source in HLS_DIR.iterdir():
-            if not source.is_file() or not self._recording_allowed_source(source) or source.name == "index.m3u8":
+            if not source.is_file() or not self._recording_allowed_source(source) or source.name == playlist_name:
                 continue
             try:
                 stat = source.stat()
@@ -4137,7 +4873,7 @@ class LiveManager:
         payload = payload or {}
         if not bool(self.status.get("running")):
             raise RuntimeError("live stream is not running")
-        playlist_source = HLS_DIR / "index.m3u8"
+        playlist_source = self._current_served_hls_playlist()
         if not playlist_source.exists():
             raise RuntimeError("HLS playlist is not ready")
         session_id = str(payload.get("session_id") or f"rec_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}")
@@ -4155,7 +4891,7 @@ class LiveManager:
                 status="starting",
                 started_at=now(),
                 started_at_unix=time.time(),
-                source_playlist="/index.m3u8",
+                source_playlist=f"/{playlist_source.name}",
                 source_segment_type=self._current_live_segment_type(),
                 segment_time=effective_segment_time(profile),
                 playlist_path=str(self._recording_playlist_path(session_id)),
@@ -4319,7 +5055,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/snapshots":
             SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
             shots = []
-            for kind in ("video", "audio"):
+            for kind in SNAPSHOT_KINDS:
                 p = SNAPSHOT_DIR / f"{kind}_snapshot.jpg"
                 if p.exists():
                     shots.append({"kind": kind, "url": f"/snapshots/{p.name}", "name": p.name, "mtime": p.stat().st_mtime})
@@ -4338,10 +5074,13 @@ class Handler(SimpleHTTPRequestHandler):
             except PermissionError:
                 return self.send_error(HTTPStatus.NOT_FOUND)
         if path == "/index.m3u8" or path.endswith(".ts") or path.endswith(".m4s") or re.match(r"^/init_[A-Za-z0-9_.-]+\.mp4$", path):
-            try:
-                target = safe_child_path(HLS_DIR, path.lstrip("/"))
-            except PermissionError:
-                return self.send_error(HTTPStatus.NOT_FOUND)
+            if path == "/index.m3u8":
+                target = MANAGER._current_served_hls_playlist()
+            else:
+                try:
+                    target = safe_child_path(HLS_DIR, path.lstrip("/"))
+                except PermissionError:
+                    return self.send_error(HTTPStatus.NOT_FOUND)
             if not target.exists() and path == "/index.m3u8":
                 return self.send_text("HLS playlist is not ready\n", "text/plain; charset=utf-8", status=HTTPStatus.SERVICE_UNAVAILABLE, extra_headers={"Retry-After": "2"})
             return self.send_file(target)
