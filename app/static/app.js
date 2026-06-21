@@ -83,7 +83,7 @@ function humanizeAlignMessage(status, monitor) {
     return "视频/音频抓帧时间差过大，已丢弃本轮，不是 OCR 错误";
   }
   if (msg === "verify OCR failed" || msg.includes("OCR failed")) {
-    return "OCR 识别失败：当前截图未识别到有效计时器";
+    return "OCR 识别失败：当前 provider 未识别到有效计时器，未继续 fallback";
   }
   if (msg.startsWith("OCR 未配置")) {
     return msg;
@@ -362,11 +362,18 @@ function renderOcrResults(status) {
   root.innerHTML = "";
   const ocr = status.last_ocr_results || {};
   const monitor = status.auto_align_monitor || {};
+  const routeText = (route) => {
+    if (route === "remote_request_failed -> rapidocr_local") return "primary/backup request failed -> rapidocr_local";
+    if (route === "ocrspace") return "primary/backup resolved at ocrspace";
+    if (route === "custom") return "primary/backup resolved at custom";
+    if (route === "rapidocr_local") return "rapidocr_local";
+    return route || "";
+  };
   const providerRouteLabel = (data) => {
     if (!data) return "";
-    if (data.route) return `provider route: ${data.route}`;
-    if (data.provider === "ocrspace") return "provider route: ocrspace";
-    if (data.provider === "custom") return "provider route: custom";
+    if (data.route) return `provider route: ${routeText(data.route)}`;
+    if (data.provider === "ocrspace") return "provider route: primary/backup resolved at ocrspace";
+    if (data.provider === "custom") return "provider route: primary/backup resolved at custom";
     if (data.provider === "rapidocr_local") return "provider route: rapidocr_local";
     return "";
   };
@@ -375,7 +382,7 @@ function renderOcrResults(status) {
       const parts = [];
       if (data.updated_at) parts.push(`更新于 ${data.updated_at}`);
       if (data.provider === "rapidocr_local" && data.note) {
-        parts.push("远端请求失败，已回退本地 RapidOCR");
+        parts.push("primary/backup 请求失败，已回退本地 RapidOCR");
       } else if (data.provider === "rapidocr_local") {
         parts.push("本地 RapidOCR");
       } else if (data.provider === "ocrspace") {
@@ -389,7 +396,7 @@ function renderOcrResults(status) {
       return "监控中";
     }
     if (data && data.detail_error) {
-      return "远端 OCR 未识别到有效计时器";
+      return "primary 未识别到有效计时器，已停止继续 fallback";
     }
     return "未识别到时间";
   };

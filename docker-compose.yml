@@ -30,9 +30,6 @@ services:
       DEFAULT_OFFSET: "${DEFAULT_OFFSET:-10}"
       OFFSET_STATE: /state/last_sync_offset.json
       STATE_DIR: /state
-      SCRIPTS_ROOT: /app/scripts
-      MODE: hls
-      OUT_DIR: /hls
       WORK_DIR: /tmp/live_4k_delay
       PORT: "18080"
       AUTO_START: "${AUTO_START:-0}"

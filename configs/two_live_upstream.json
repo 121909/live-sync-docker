@@ -1,0 +1,14 @@
+{
+  "command": [
+    "python3",
+    "-u",
+    "scripts/serve_two_live.py",
+    "/root/live-sync-docker/testvideo/tw2.ts",
+    "/root/live-sync-docker/testvideo/xhs2.mkv",
+    "--copy",
+    "--port",
+    "8800",
+    "--root",
+    "/root/live-sync-docker/work/two_live"
+  ]
+}

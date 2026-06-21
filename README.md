@@ -1,19 +1,20 @@
 # 直播同步管理
 
-把一路高画质视频和一路中文解说音频合成为本地 HLS 直播流。典型用途是保留 4K 画面，同时使用中文解说，并输出给浏览器、VLC 或 Emby 播放。
+把一路视频源和一路音频源合成为本地 HLS 直播流，适合“保留高码率画面 + 使用另一条解说音频”的场景。当前正式服务入口只有 `app/server.py`，推荐通过 Docker Compose 运行。
 
-## 主要能力
+## 当前能力
 
-- 视频源和音频源分开选择，输出只使用主视频源画面和音频源声音。
-- 支持远程 M3U 和本地粘贴 M3U，按频道名选择主视频、备用视频和音频频道。
-- 默认启用低请求本地缓存：每路上游由一个常驻 ffmpeg 连接读取，截图、OCR 和合并都读本地缓存。
-- 默认不转码，视频、音频和源缓存都使用 `copy`。
-- 自动 OCR 读取两路画面里的比赛计时器，计算并切换 offset。
-- 自动截图和自动对齐使用同一个周期：截图保存后立即用同一批帧做 OCR 检查。
-- 视频源失败后会刷新 M3U；链接变化时使用新链接，链接未变时切换备用频道。
-- 支持每日赛程自动启停，也可以在 WebUI 手动启动和停止。
-- 支持录制当前输出，停止后可选择是否合并为单文件。
-- 输出 `/index.m3u8` 和 Emby 可用的 `/emby.m3u`。
+- WebUI 管理视频源、音频源、请求头、偏移、HLS 参数和赛程开关。
+- 支持远程 M3U 和直接粘贴本地 M3U 内容。
+- 视频和音频都支持主频道 + fallback 频道。
+- 默认启用本地源缓存：上游各维持一个常驻 ffmpeg 读取，输出、截图和自动对齐都读本地缓存。
+- 支持正负偏移。
+  - 正数：延迟视频。
+  - 负数：延迟音频。
+- 支持自动截图、OCR 识别比赛计时器、自动校正 offset。
+- 支持按赛程自动启停直播。
+- 支持录制当前输出，并在停止后合并为单个 `mkv` 文件。
+- 提供 HLS、Emby M3U、简单 XMLTV 和 `strm` 辅助接口。
 
 ## 快速启动
 
@@ -46,181 +47,169 @@ docker logs -f live-sync-cctv
 docker compose down
 ```
 
-默认容器内端口是 `18080`。宿主机绑定地址和端口可以通过 `HOST_BIND`、`PORT` 调整，例如：
+宿主机监听地址和端口可覆盖：
 
 ```bash
 HOST_BIND=127.0.0.1 PORT=18081 docker compose up -d --build
 ```
 
-## 容器内网 SSH 测试
+## 部署说明
 
-镜像默认启动 `sshd`，只在 Docker Compose 内部网络声明 `22` 端口，不映射到宿主机。默认测试账号：
+- 镜像基于 `debian:12-slim`。
+- 运行依赖由镜像内安装，不依赖宿主机 `.venv/`。
+- 主服务监听容器内 `18080`。
+- Compose 默认挂载：
+  - `./state:/state`
+  - `./hls:/hls`
+- 启动命令由 `scripts/docker-entrypoint.sh` 拉起 `sshd` 后再执行 `python3 -m app.server`。
+
+## WebUI 使用
+
+1. 填写视频 M3U 地址，或直接粘贴“本地视频 M3U 内容”。
+2. 刷新视频频道并选中要使用的频道。
+   第 1 个为主源，其余按顺序作为 fallback。
+3. 填写音频 M3U 地址，或直接粘贴“本地音频 M3U 内容”。
+4. 刷新音频频道并选中要使用的频道。
+   第 1 个为主音频，其余按顺序作为 fallback。
+5. 按需要设置 `offset_seconds`、本地缓存、自动对齐、赛程和 HLS 参数。
+6. 点击“保存”。
+7. 点击“启动”或“重启”。
+
+WebUI 中的主要工具：
+
+- `同步截图`
+  抓取当前四个截图槽位：`cache_video`、`cache_audio`、`video`、`audio`。
+- `测试 OCR 服务`
+  用内置测试图验证当前 OCR 配置。
+- `开始录制` / `停止录制`
+  保存当前输出 HLS，并可导出单个 `mkv`。
+- `刷新赛程`
+  立即重新拉取赛程。
+- `清理 HLS`
+  清空 `hls/` 输出。
+- `清理状态`
+  清理 `state/` 下的运行时状态，但保留 `profile.json`、`last_sync_offset.json` 和录制目录。
+
+## 输出地址
+
+默认输出：
+
+- HLS: `/index.m3u8`
+- Emby M3U: `/emby.m3u`
+- XMLTV: `/guide.xml`
+- STRM: `/cctv5.strm`
+
+示例：
 
 ```text
-用户：debug
-密码：live-sync
+http://<服务器IP>:18080/index.m3u8
+http://<服务器IP>:18080/emby.m3u
+http://<服务器IP>:18080/guide.xml
 ```
 
-可以通过环境变量调整或关闭：
-
-```bash
-SSHD_USER=tester SSHD_PASSWORD='change-me' docker compose up -d --build
-SSHD_ENABLED=0 docker compose up -d --build
-```
-
-同一 Docker 网络里的容器可以用服务名访问：
-
-```bash
-ssh debug@live-sync
-```
-
-## WebUI 使用流程
-
-1. 在“频道选择”里填写视频 M3U 地址，或粘贴“本地视频 M3U 内容”。
-2. 点击“刷新视频频道”，筛选并选中频道，点击“设为主源”。
-3. 如需备用源，选中其他视频频道后点击“加入备用”。
-4. 填写音频 M3U 地址，或粘贴“本地音频 M3U 内容”。
-5. 点击“刷新音频频道”，筛选并选中中文解说频道，点击“设为音频”。
-6. 在“基础设置”里确认 offset、低请求本地缓存、自动对齐、ROI 和 HLS 参数。
-7. 点击“保存”，再点击“启动”。
-8. 用“工具 / 截图”里的“同步截图”检查两路计时器位置。
-9. 复制 HLS 地址，或在 Emby 中使用 `/emby.m3u`。
-10. 需要留档时，点“开始录制”，停止后可在录制列表里选择是否合并成单文件。
-
-WebUI 中填写的 M3U、请求头、频道名、offset、ROI 和自动对齐配置会保存到 `state/profile.json`。容器重启、`AUTO_START` 和赛程自动启动都依赖这份配置。
-
-## 请求模型
-
-默认 `LOCAL_CACHE_ENABLED=1`。启动后程序会先为视频源和音频源各启动一个本地滚动缓存：
-
-```text
-上游视频源 -> 本地 video_cache.m3u8
-上游音频源 -> 本地 audio_cache.m3u8
-```
-
-后续合并、截图和自动 OCR 都读取本地缓存，不再为截图或对齐额外请求直播地址。播放器访问的是本地 `/index.m3u8` 和本地分片，也不会直接请求上游。
-
-如果关闭低请求缓存，程序会回到直接读取上游的方式，截图和 OCR 可能产生额外短请求。
+`PUBLIC_BASE_URL` 已设置时，`/emby.m3u` 和 `/cctv5.strm` 会使用该地址生成外部播放 URL。
 
 ## 自动对齐
 
-程序按“截图/检查间隔”抓取视频源缓存和音频源缓存各一帧，先保存截图，再立即用同一批帧做 OCR 检查。
+当前实现以 `app/auto_align.py` + `app/server.py` 为准，行为是：
 
-计时器位置查找顺序：
+- 自动对齐依赖本地源缓存；关闭本地缓存时，自动对齐会暂停。
+- 自动对齐默认只在比赛窗口内工作。
+  - 如果关闭赛程功能，则始终允许。
+  - 如果开启 `auto_align_debug_override`，则忽略比赛窗口限制。
+- 每轮流程是：
+  - 从本地缓存抓取视频/音频探测帧
+  - OCR 识别两边计时器
+  - 计算候选 offset
+  - 验证候选值
+  - 验证通过后热切换到新 offset
+- 自动对齐状态会显示在 WebUI 的 `auto_align_state` 和监控面板中。
 
-1. 先尝试当前配置或已锁定的 `视频计时器区域` / `音频计时器区域`。
-2. 读不到时，按对应的预设 ROI 列表逐个尝试。
-3. 预设也读不到时，扫描画面上三分之一区域自动寻找计时器。
+当前支持的 OCR 路径：
 
-预设 ROI 或自动扫描命中后会锁定为当前 ROI。换频道或管线重建后，会重新按这个顺序寻找。
+- `OCR.space`
+- 自定义 OpenAI 兼容接口
+- `RapidOCR` 本地兜底
 
-计时器会换算为比赛秒数：
+自动对齐是否可用，不只取决于 WebUI 选择的 OCR 服务商；只要本地 `RapidOCR` 可用，或远端 OCR 配置完整，就会启用相关能力。
 
-- `51:20` 解析为第 3080 秒。
-- `45:00+02:13` 解析为第 2833 秒。
-- 补时显示在下方一行时，也会尝试合并识别。
+## 赛程自动启停
 
-候选 offset 的计算方式：
+当前仅支持 `espn` 作为赛程提供方。
 
-```text
-offset = -(音频源比赛时间 - 视频源比赛时间)
-```
+赛程相关行为：
 
-例如中文源计时器比 4K 画面慢 25 秒，候选 offset 就是 `+25`，程序会延迟视频来等待中文音频。
+- 启动时会启动后台调度线程。
+- 调度线程按轮询周期刷新赛程并判断当前是否处于比赛窗口。
+- 在比赛窗口内，如果当前没有运行且没有手动阻止，会自动启动直播。
+- 如果直播是由赛程线程启动的，离开比赛窗口后会自动停止。
+- 手动停止会在当前比赛窗口内生效，直到这场比赛窗口结束后才恢复自动接管。
 
-如果没有计时器、只有一边读到计时器、或 OCR 结果超过最大 offset，程序不会调整，会继续沿用当前 offset。只有连续多次得到稳定的新 offset，才会预热新 HLS 管线并切换。两边计时器完全一致时，会立即应用新的 offset。
+## 录制
 
-默认内置计时器预设区域：
+录制直接镜像当前输出 HLS，不会额外请求原始上游。
 
-```text
-视频：
-0.132,0.055,0.078,0.140
-0.333,0.058,0.080,0.140
-0.114,0.049,0.077,0.077
-0.111,0.000,0.077,0.185
+当前录制行为：
 
-音频：
-0.824,0.080,0.078,0.140
-```
-
-## 常用参数
-
-| WebUI 参数 | 说明 |
-| --- | --- |
-| `初始偏移秒` | 启动时使用的 offset。正数表示延迟视频，负数表示延迟音频。 |
-| `低请求本地缓存（不转码）` | 默认开启。每路上游只由一个常驻 ffmpeg 连接读取，并用 `copy` 写成本地滚动 HLS。 |
-| `本地缓存秒数` | 默认 360 秒。实际保留时间会至少覆盖当前 offset 和少量缓冲。 |
-| `截图/检查间隔（秒）` | 自动截图周期；截图保存后会立即用同一批帧做自动对齐检查。 |
-| `连续不一致次数` | 连续多少次发现稳定偏差后才真正调整。 |
-| `允许误差（秒）` | 候选 offset 和当前 offset 差值小于该值时认为已对齐。 |
-| `最大偏移（秒）` | 超过该范围的 OCR 结果会被丢弃。 |
-| `OCR 服务商` | 仅支持第三方 OCR。配置可用服务商后，自动对齐自动开启；未配置则关闭。 |
-| `OCR.space API Key` / `自定义 OCR API Key` / `自定义端点 URL` / `模型名称` | 第三方 OCR 服务配置。OCR.space fallback 使用独立的 OCR.space Key。 |
-| `测试 OCR 服务` | 立即校验当前 OCR 服务商配置是否可用。 |
-| `分片时长` | HLS 每个分片的目标时长，默认不小于 4 秒。 |
-| `播放列表分片数` | 播放器可回看的分片数量，窗口约等于 `分片时长 * 分片数`。 |
-
-
-## OCR 计时器识别
-
-默认使用第三方 OCR 识别计时器。当前支持 [OCR.space](https://ocr.space) 和自定义 OpenAI 兼容接口。
-
-注册地址：https://ocr.space/ocrapi （免费用户每月 25,000 次请求）
-
-### 配置方式
-
-1. 选择 OCR 服务商。
-2. 填写对应服务商的 API Key；如果是自定义服务商，还需要填写端点 URL，可选模型名称。
-3. 点击“测试 OCR 服务”确认配置可用。
-4. 保存后，若 OCR 服务商配置有效，自动对齐会自动开启；未配置则自动关闭。
-
-如果不配置可用的 OCR 服务商，自动对齐会关闭，不影响直播输出。
-
-### 工作方式
-
-未锁定计时器位置时，服务会对截图做智能扫描：
-
-1. 发送画面上半部分给 OCR 服务 → 找到计时器文本和位置。
-2. 根据文本在左半还是右半，下次只发送对应的四分之一区域。
-3. 逐次缩小范围，快速定位计时器位置。
-
-锁定 ROI 后，只发送 ROI 区域给 OCR 服务，节省请求量。
-
-### 对齐频率
-
-- 未对齐前：每 15 秒检查一次（快速收敛）。
-- 对齐后：每 5 分钟检查一次（低频率，保持稳定）。
-- 未锁定 ROI：每 30 秒全图扫描。
+- 录制目录：`state/recordings/<session_id>/`
+- 保存播放列表和当前分片副本
+- 停止后可在 WebUI 中执行合并
+- 当前只支持导出 `mkv`
 
 ## 环境变量
 
-常用环境变量可以在启动命令前设置，也可以写入 `docker-compose.yml` 的 `environment`。
+常用变量如下。除非特别说明，WebUI 保存的配置会覆盖运行时配置。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `HOST_BIND` | `0.0.0.0` | 宿主机绑定地址，仅 Compose 端口映射使用。 |
+| `PORT` | `18080` | 宿主机暴露端口；容器内服务仍监听 `18080`。 |
 | `AUTO_START` | `0` | 容器启动后是否自动启动直播。 |
-| `DEFAULT_OFFSET` | `10` | 没有保存 offset 时的默认值。 |
-| `SYNC_OFFSET` | 空 | 强制指定启动 offset。 |
-| `LOCAL_CACHE_ENABLED` | `1` | 是否启用低请求本地缓存。 |
-| `LOCAL_CACHE_SECONDS` | `360` | 本地源缓存秒数。 |
-| `AUTO_ALIGN_INTERVAL` | `60` | 自动截图和检查周期。 |
-| `AUTO_ALIGN_SAMPLES` | `3` | 连续确认次数。 |
-| `AUTO_ALIGN_THRESHOLD` | `1` | offset 允许误差秒数。 |
-| `AUTO_ALIGN_MAX_OFFSET` | `180` | 最大允许 offset。 |
-| `OCR_PROVIDER` | 空 | OCR 服务商，支持 `ocrspace` 或 `custom`。 |
-| `OCR_API_KEY` | 空 | 自定义 OCR 服务的 API Key。 |
-| `OCRSPACE_API_KEY` | 空 | OCR.space 专用 API Key。 |
-| `OCR_CUSTOM_ENDPOINT` | 空 | 自定义 OCR 服务端点，需为 OpenAI 兼容接口。 |
-| `OCR_CUSTOM_MODEL` | `gpt-4o` | 自定义 OCR 服务使用的模型名。 |
-| `OUTPUT_AUDIO_CODEC` | `copy` | 输出音频编码固定为 `copy`，不转码。 |
-| `HLS_SEGMENT_TYPE` | `auto` | 输出 HLS 分片类型。`auto` 按频道名判断：带 `4k` 使用 fMP4，否则使用 MPEG-TS。 |
-| `STRIP_DOVI_RPU` | `1` | HEVC 源是否移除 Dolby Vision RPU 附加 NAL。 |
+| `DEFAULT_OFFSET` | `10` | 无保存状态时的默认 offset。 |
+| `SYNC_OFFSET` | 空 | 启动时强制使用该 offset。 |
+| `VIDEO_M3U_URL` | 空 | 默认视频 M3U 地址，支持多行。 |
+| `AUDIO_M3U_URL` | 空 | 默认音频 M3U 地址，支持多行。 |
+| `VIDEO_CHANNEL_NAME` | 空 | 默认视频主频道名。 |
+| `AUDIO_CHANNEL_NAME` | 空 | 默认音频主频道名。 |
+| `FALLBACK_VIDEO_CHANNELS` | 空 | 默认视频 fallback 列表。 |
+| `FALLBACK_AUDIO_CHANNELS` | 空 | 默认音频 fallback 列表。 |
+| `VIDEO_HEADERS` | 空 | 默认视频请求头，多行 `Header: value`。 |
+| `AUDIO_HEADERS` | 空 | 默认音频请求头，多行 `Header: value`。 |
+| `LOCAL_CACHE_ENABLED` | `1` | 是否启用本地源缓存。 |
+| `LOCAL_CACHE_SECONDS` | `360` | 本地源缓存目标深度。 |
+| `SEGMENT_TIME` | `4` | HLS 分片时长。 |
+| `PLAYLIST_SIZE` | `60` | HLS 播放列表保留分片数。 |
+| `HLS_SEGMENT_TYPE` | `auto` | HLS 分片类型。当前 `auto` 最终会走 `mpegts`。 |
+| `STRIP_DOVI_RPU` | `1` | HEVC copy 时是否移除 Dolby Vision RPU 附加 NAL。 |
+| `OUTPUT_AUDIO_CODEC` | `copy` | 输出音频编码，当前非 `copy` 时回落为 `aac`。 |
+| `PUBLIC_BASE_URL` | 空 | 生成对外播放地址时使用的基础 URL。 |
+| `CHANNEL_ID` | `cctv5-4k-cn` | `/emby.m3u` 和 `/guide.xml` 使用的频道 ID。 |
+| `CHANNEL_NAME` | `CCTV5 4K Chinese` | 默认输出频道名。 |
+| `CHANNEL_NUMBER` | `5` | `/emby.m3u` 使用的频道号。 |
+| `CHANNEL_GROUP` | `Sports` | `/emby.m3u` 使用的频道分组。 |
+| `AUTO_ALIGN_INTERVAL` | `60` | 自动截图 / 自动对齐检查周期。 |
+| `AUTO_ALIGN_THRESHOLD` | `1` | 候选 offset 的最小变化阈值。 |
+| `AUTO_ALIGN_MAX_OFFSET` | `180` | 允许的最大 offset。 |
+| `OCR_PROVIDER` | 空 | 优先 OCR 服务商，`ocrspace` 或 `custom`。 |
+| `OCRSPACE_API_KEY` | 空 | OCR.space API Key。 |
+| `OCR_API_KEY` | 空 | 自定义 OCR API Key。 |
+| `OCR_CUSTOM_ENDPOINT` | 空 | 自定义 OCR 端点。 |
+| `OCR_CUSTOM_MODEL` | `gpt-4o` | 自定义 OCR 模型名。 |
 | `FFMPEG_USER_AGENT` | `Emby` | 默认 ffmpeg User-Agent。 |
-| `DEFAULT_REQUEST_HEADERS` | 空 | 全局默认请求头，多行 `Header: value`。 |
+| `DEFAULT_REQUEST_HEADERS` | 空 | ffmpeg 默认请求头，多行 `Header: value`。 |
 | `LOG_REDACT_URLS` | `0` | 是否在日志中隐藏 URL。 |
-| `PUBLIC_BASE_URL` | 空 | 对外公开的基础 URL，用于生成播放地址。 |
-
-录制文件保存在 `state/recordings/<session_id>/` 下，停止后可通过 WebUI 选择输出 `MKV` 或 `MP4`。
+| `SCHEDULE_ENABLED` | `1` | 是否启用赛程自动启停。 |
+| `SCHEDULE_PROVIDER` | `espn` | 赛程提供方，当前仅支持 `espn`。 |
+| `SCHEDULE_LEAGUE` | `fifa.world` | ESPN 赛程 league。 |
+| `SCHEDULE_TIMEZONE` | `Asia/Shanghai` | 赛程展示和窗口计算时区。 |
+| `SCHEDULE_REFRESH_HOURS` | `24` | 赛程刷新缓存周期。 |
+| `SCHEDULE_POLL_SECONDS` | `60` | 调度轮询周期。 |
+| `SCHEDULE_PRE_MINUTES` | `10` | 比赛前提前启动分钟数。 |
+| `SCHEDULE_DURATION_MINUTES` | `150` | 比赛主体窗口分钟数。 |
+| `SCHEDULE_POST_MINUTES` | `20` | 比赛后额外保留分钟数。 |
+| `SSHD_ENABLED` | `1` | 是否在容器内启动 sshd。 |
+| `SSHD_USER` | `root` | sshd 用户名。 |
+| `SSHD_PASSWORD` | `live-sync` | sshd 密码。 |
 
 示例：
 
@@ -228,121 +217,86 @@ offset = -(音频源比赛时间 - 视频源比赛时间)
 AUTO_START=1 LOCAL_CACHE_SECONDS=300 docker compose up -d --build
 ```
 
-设置全局请求头：
-
 ```bash
 DEFAULT_REQUEST_HEADERS=$'User-Agent: Emby\nAccept: */*\nCache-Control: no-cache\nPragma: no-cache' docker compose up -d --build
 ```
 
-## 输出格式和播放
+## SSH 调试
 
-默认按频道名选择输出格式：
+镜像默认启动 `sshd`。
 
-- 频道名包含 `4k` 时使用 fMP4。
-- 其它频道使用 MPEG-TS。
+当前 Compose 配置会把容器 `22` 端口映射到宿主机 `172.17.0.1:2222`，并且同时 `expose 22` 供同一 Docker 网络内其他容器访问。
 
-默认视频、音频和本地缓存都使用 `copy`，不主动转码。多音轨源会优先选择 AAC 音轨并直接复制。
+默认账号取决于 Compose 环境变量：
 
-如果某个播放器或 Emby 不支持 fMP4 HLS，可以回退到 MPEG-TS：
+```text
+用户：root
+密码：live-sync
+```
+
+关闭或覆盖：
 
 ```bash
-HLS_SEGMENT_TYPE=mpegts docker compose up -d --build
+SSHD_ENABLED=0 docker compose up -d --build
+SSHD_USER=debug SSHD_PASSWORD='change-me' docker compose up -d --build
 ```
 
-Emby 添加 Live TV M3U tuner：
-
-```text
-http://<服务器IP>:18080/emby.m3u
-```
-
-可选 XMLTV：
-
-```text
-http://<服务器IP>:18080/guide.xml
-```
-
-如果 Emby 在另一台机器或另一个容器里，确保它能访问：
-
-```text
-http://<服务器IP>:18080/index.m3u8
-```
-
-4K HEVC 最好让 Emby Direct Play。如果 Emby 触发转码，CPU/GPU 占用会很高，也更容易卡顿。
-
-## 目录和隐私
-
-运行时会写入这些目录：
+## 目录说明
 
 | 路径 | 说明 |
 | --- | --- |
-| `state/profile.json` | WebUI 保存的配置，包括 M3U、请求头、频道名、offset、ROI 和自动对齐参数。 |
-| `state/last_sync_offset.json` | 最近一次可靠 offset。 |
-| `state/snapshots/` | 视频和音频截图。 |
-| `hls/` | 输出 HLS 播放列表和分片。 |
-| `data/work/source_cache/` 或容器内 `WORK_DIR/source_cache/` | 低请求模式下的本地滚动源缓存，运行时自动创建和清理。 |
+| `app/server.py` | 主服务与 Web API。 |
+| `app/auto_align.py` | 自动对齐控制器。 |
+| `app/static/` | WebUI 静态资源。 |
+| `configs/ocr/rapidocr_timer.yaml` | RapidOCR 配置。 |
+| `state/profile.json` | WebUI 保存的配置。 |
+| `state/last_sync_offset.json` | 最近一次保存的 offset。 |
+| `state/snapshots/` | 截图输出。 |
+| `state/recordings/` | 录制与合并输出。 |
+| `hls/` | 当前直播 HLS 输出。 |
+| `scripts/docker-entrypoint.sh` | 容器入口脚本。 |
 
-不要公开或提交 `state/profile.json`，里面可能包含源 URL、请求头、Cookie 或本地 M3U 内容。
+## 辅助脚本
 
-日志默认会显示实际 URL，包括 ffmpeg 打开的输入地址和源站报错地址。需要隐藏 URL 时：
+仓库里还保留了一组与主服务独立的 8800 辅助上游工具：
 
-```bash
-LOG_REDACT_URLS=1 docker compose up -d --build
-```
+- `scripts/serve_two_live.py`
+- `scripts/restart_two_live_upstream.py`
+- `scripts/two_live_upstream_scheduler.sh`
+- `configs/two_live_upstream.json`
+
+这组脚本用于把本地素材发布成两个滚动 HLS 上游，方便本地测试，不属于正式 WebUI 主链路。
 
 ## 排错
 
-先看最近日志：
+先看日志：
 
 ```bash
 docker logs --tail=200 live-sync-cctv
 ```
 
-重点关注源超时、频道切换、ffmpeg 退出、自动对齐 handoff 失败和上游 403。
+常见问题：
 
-### 上游 403
+- `HTTP error 403` 或源站拒绝
+  优先检查视频/音频请求头、UA、Cookie、Referer。
+- `/index.m3u8` 短暂返回 `503`
+  一般表示管线正在启动、重启或切换，不一定是故障。
+- 自动对齐长期为 `disabled`
+  先确认本地缓存没有关闭，再检查 OCR 是否可用，以及当前是否处于比赛窗口。
+- 录制无法合并
+  当前只支持导出 `mkv`。
+- 上游分片持续不更新
+  重点看 ffmpeg stderr、源缓存是否退出、以及 `timeout_seconds` 与上游稳定性。
 
-如果日志出现 `HTTP error 403 Forbidden`，程序会输出 `upstream context ...`。其中 `input0` 是视频输入，`input1` 是音频输入，可以判断是哪一路被上游拒绝。
+## 隐私与本地产物
 
-默认 ffmpeg 请求头：
+`state/profile.json` 可能包含：
 
-```text
-User-Agent: Emby
-Accept: */*
-Cache-Control: no-cache
-Pragma: no-cache
-```
+- 源 URL
+- 请求头
+- Cookie
+- 本地粘贴的 M3U 内容
 
-如果源要求特定 UA：
+不要把这些内容直接公开或提交到仓库。
 
-```bash
-FFMPEG_USER_AGENT="你的 User-Agent" docker compose up -d --build
-```
-
-如果源要求额外请求头，优先在 WebUI 的视频/音频请求头里填写，格式为每行一个 `Header: value`。
-
-### 播放器短暂 503
-
-播放器请求 `/index.m3u8` 时如果短暂返回 503，通常表示管线正在启动、重启或还没生成新播放列表，不代表播放器访问被拒绝。
-
-### OCR 不准
-
-先用“同步截图”确认两边 ROI 是否覆盖计时器，再调整 `视频计时器区域`、`音频计时器区域` 或预设 ROI。
-
-如果 OCR 占用 CPU 高，可以调大“截图/检查间隔（秒）”。
-
-### 视频闪烁
-
-如果只在非 HDR 电视、手机或浏览器里出现闪烁，优先怀疑设备或播放器的 HDR/HLG/Dolby Vision 兼容性。
-
-4K 源出现短暂闪烁或花屏，通常是源里 Dolby Vision RPU 元数据异常或 HEVC PPS/NAL 解析错误导致。日志里出现以下内容多半是源端问题：
-
-```text
-[hevc] Error parsing NAL unit
-[hevc] Multiple Dolby Vision RPUs found in one AU. Skipping previous.
-```
-
-程序默认会在探测到 HEVC 源时移除 Dolby Vision RPU 附加 NAL，以降低解析出错和闪烁概率。需要保留 Dolby Vision 元数据时：
-
-```bash
-STRIP_DOVI_RPU=0 docker compose up -d --build
-```
+仓库当前还包含一些本地运行产物，例如 `.venv/`、`work/`、`hls/`、`core.*`、`testvideo/`。这些不属于服务说明的一部分，按本地环境自行管理。

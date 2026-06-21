@@ -3000,11 +3000,13 @@ class LiveManager:
             if idx > 0 and full_frame:
                 self.log(f"OCR primary '{providers[0]}' failed, fallback to '{provider}'")
             provider_result = self._try_ocr_provider(provider, frame_path, profile)
-            if provider_result.request_failed:
-                any_request_failure = True
             found = coerce_clock_sample(provider_result.value)
             if found:
                 return found
+            if provider_result.request_failed:
+                any_request_failure = True
+                continue
+            return None
         if providers and not any_request_failure:
             return None
         found = coerce_clock_sample(self._rapidocr_time(frame_path))
@@ -3949,7 +3951,7 @@ class LiveManager:
             return
         route = ""
         if provider == "rapidocr_local" and note:
-            route = "remote -> rapidocr_local"
+            route = "remote_request_failed -> rapidocr_local"
         elif provider:
             route = provider
         with self.lock:
@@ -3988,14 +3990,16 @@ class LiveManager:
             if provider_result.request_failed:
                 any_request_failure = True
                 remote_failure_note = "remote request failed"
+                continue
             result = provider_result.value
             if result:
                 parsed_text = self._parse_ocr_text_candidates(result[1], allow_timer_only=True)
                 if parsed_text:
                     return parsed_text.game_time, parsed_text.text, provider, ""
                 remote_failure_note = "remote OCR returned text but no valid clock"
-            elif not provider_result.request_failed:
+            else:
                 remote_failure_note = "remote OCR recognized no valid clock"
+            return None
         if providers and not any_request_failure:
             return None
         rapid = self._rapidocr_time(frame_path)

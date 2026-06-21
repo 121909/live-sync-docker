@@ -8,15 +8,18 @@ RUN apt-get update && \
       ffmpeg \
       openssh-server \
       python3 \
-      python3-opencv \
-      python3-pil \
+      python3-pip \
       tini && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+COPY requirements.txt /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
 COPY scripts/ /app/scripts/
 COPY app/ /app/app/
+COPY configs/ /app/configs/
 
 RUN chmod +x /app/scripts/*.sh /app/scripts/*.py /app/app/server.py && \
     mkdir -p /state /hls /tmp/live_4k_delay
@@ -35,4 +38,4 @@ ENV OFFSET_STATE=/state/last_sync_offset.json \
 EXPOSE 18080 22
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/scripts/docker-entrypoint.sh", "python3", "/app/app/server.py"]
+CMD ["/app/scripts/docker-entrypoint.sh", "python3", "-m", "app.server"]
