@@ -528,16 +528,35 @@ function renderSnapshots(items) {
       label.textContent = entry.label;
       slot.append(label);
 
-      const img = document.createElement("img");
-      img.alt = `${group.title}${entry.label}`;
-      img.loading = "lazy";
+      const frame = document.createElement("div");
+      frame.className = "snapshot-frame";
+      const empty = document.createElement("div");
+      empty.className = "snapshot-empty";
+      empty.textContent = item.url ? "载入截图中" : "等待截图";
+      frame.append(empty);
       if (item.url) {
+        const img = document.createElement("img");
+        img.className = "snapshot-image";
+        img.alt = "";
+        img.setAttribute("aria-hidden", "true");
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.addEventListener("load", () => {
+          slot.classList.add("is-ready");
+        });
+        img.addEventListener("error", () => {
+          empty.textContent = "截图暂不可用";
+          slot.classList.add("is-failed");
+          img.remove();
+        });
         img.src = `${item.url}?t=${item.mtime || 0}`;
+        frame.append(img);
       }
-      slot.append(img);
+      slot.append(frame);
 
       const meta = document.createElement("span");
-      meta.textContent = item.url ? item.name : "暂无截图";
+      meta.className = "snapshot-slot-meta";
+      meta.textContent = item.url ? `更新于 ${formatProbeTime(item.mtime) || "-"}` : "等待下一次截图";
       slot.append(meta);
 
       panel.append(slot);

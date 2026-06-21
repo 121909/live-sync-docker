@@ -88,6 +88,8 @@
           <div class="topbar-actions">
             <button id="saveConfig" type="button">保存</button>
             <button id="refreshBtn" type="button">刷新</button>
+            <button id="clearHls" class="danger" type="button">清理 HLS</button>
+            <button id="clearState" class="danger" type="button">清理状态</button>
             <button id="startBtn" class="primary" type="button">启动</button>
             <button id="restartBtn" type="button">重启</button>
             <button id="stopBtn" class="danger" type="button">停止</button>
@@ -185,6 +187,21 @@
                     <div class="status-span-2"><span>赛程信息</span><strong id="scheduleMsg">-</strong></div>
                   </div>
                 </section>
+
+                <section class="panel">
+                  <div class="panel-head">
+                    <div>
+                      <p class="eyebrow">Schedule</p>
+                      <h3>赛程自动启停</h3>
+                    </div>
+                  </div>
+                  <div class="form-grid">
+                    <label class="field full checkbox-field"><input name="schedule_enabled" type="checkbox" /> <span>按赛程自动启停</span></label>
+                    <label class="field"><span>提前启动（分钟）</span><input name="schedule_pre_minutes" type="number" min="0" /></label>
+                    <label class="field"><span>比赛窗口（分钟）</span><input name="schedule_duration_minutes" type="number" min="90" /></label>
+                    <label class="field"><span>赛后停止（分钟）</span><input name="schedule_post_minutes" type="number" min="0" /></label>
+                  </div>
+                </section>
               </div>
 
               <p id="lastError" class="error"></p>
@@ -211,35 +228,6 @@
                   </div>
                 </section>
 
-                <section class="panel">
-                  <div class="panel-head">
-                    <div>
-                      <p class="eyebrow">Schedule</p>
-                      <h3>赛程自动启停</h3>
-                    </div>
-                  </div>
-                  <div class="form-grid">
-                    <label class="field full checkbox-field"><input name="schedule_enabled" type="checkbox" /> <span>按赛程自动启停</span></label>
-                    <label class="field"><span>提前启动（分钟）</span><input name="schedule_pre_minutes" type="number" min="0" /></label>
-                    <label class="field"><span>比赛窗口（分钟）</span><input name="schedule_duration_minutes" type="number" min="90" /></label>
-                    <label class="field"><span>赛后停止（分钟）</span><input name="schedule_post_minutes" type="number" min="0" /></label>
-                  </div>
-
-                  <div class="schedule-summary">
-                    <div class="schedule-summary-card">
-                      <span>赛程状态</span>
-                      <strong id="scheduleStatusCard">-</strong>
-                    </div>
-                    <div class="schedule-summary-card">
-                      <span>当前比赛</span>
-                      <strong id="scheduleActiveCard">-</strong>
-                    </div>
-                    <div class="schedule-summary-card">
-                      <span>下一场</span>
-                      <strong id="scheduleNextCard">-</strong>
-                    </div>
-                  </div>
-                </section>
               </div>
 
               <section class="panel">
@@ -343,11 +331,6 @@
                   </div>
                 </section>
 
-              </div>
-            </section>
-
-            <section class="view" data-view="tools">
-              <div class="panel-grid">
                 <section class="panel">
                   <div class="panel-head">
                     <div>
@@ -360,7 +343,11 @@
                   <div id="ocrResults" class="ocr-results"></div>
                   <div id="snapshotGallery" class="snapshots"></div>
                 </section>
+              </div>
+            </section>
 
+            <section class="view" data-view="tools">
+              <div class="panel-grid">
                 <section class="panel">
                   <div class="panel-head">
                     <div>
@@ -377,31 +364,27 @@
                       <button id="refreshRecordings" class="secondary" type="button">刷新列表</button>
                     </div>
                   </div>
-                  <div class="recording-toolbar">
-                    <button id="startRecording" type="button">开始录制</button>
-                    <button id="stopRecording" class="secondary" type="button">停止录制</button>
-                  </div>
-                  <div class="form-grid">
-                    <label class="field full checkbox-field"><input name="schedule_recording_enabled" type="checkbox" /> <span>随赛程自动开始/停止录制</span></label>
-                    <div class="field full">
-                      <span>今明两天比赛选择</span>
-                      <div id="scheduleMatchPicker" class="stacked-options">今明两天暂无可选比赛。</div>
+                  <div class="recording-workspace">
+                    <div class="recording-layout">
+                      <div class="recording-controls">
+                        <div class="recording-toolbar">
+                          <button id="startRecording" type="button">开始录制</button>
+                          <button id="stopRecording" class="secondary" type="button">停止录制</button>
+                        </div>
+                        <div class="recording-policy">
+                          <label class="field full checkbox-field"><input name="schedule_recording_enabled" type="checkbox" /> <span>随赛程自动开始/停止录制</span></label>
+                        </div>
+                        <div id="recordingStatus" class="recording-status">未开始</div>
+                      </div>
+                      <div class="recording-selection">
+                        <div class="recording-selection-head">
+                          <span>今明两天比赛选择</span>
+                          <small>仅用于随赛程自动录制，不影响直播自动启停。</small>
+                        </div>
+                        <div id="scheduleMatchPicker" class="stacked-options">今明两天暂无可选比赛。</div>
+                      </div>
                     </div>
-                  </div>
-                  <div id="recordingStatus" class="recording-status">未开始</div>
-                  <div id="recordingList" class="recording-list"></div>
-                </section>
-
-                <section class="panel">
-                  <div class="panel-head">
-                    <div>
-                      <p class="eyebrow">Maintenance</p>
-                      <h3>维护操作</h3>
-                    </div>
-                  </div>
-                  <div class="maintenance-grid">
-                    <button id="clearHls" class="danger" type="button">清理 HLS</button>
-                    <button id="clearState" class="danger" type="button">清理状态</button>
+                    <div id="recordingList" class="recording-list"></div>
                   </div>
                 </section>
               </div>

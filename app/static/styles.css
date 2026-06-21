@@ -550,7 +550,7 @@ h3 {
 }
 
 .compact-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
 }
 
 .browser-grid {
@@ -795,7 +795,7 @@ h3 {
 }
 
 .snapshots {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
 .snapshot-panel {
@@ -821,6 +821,7 @@ h3 {
   text-decoration: none;
   font-size: 12px;
   font-weight: 600;
+  min-width: 0;
 }
 
 .snapshot-slot-label {
@@ -828,14 +829,46 @@ h3 {
   letter-spacing: 0.08em;
 }
 
-.snapshots img {
+.snapshot-frame {
+  position: relative;
+  display: grid;
+  place-items: center;
   width: 100%;
-  min-height: 180px;
   aspect-ratio: 16 / 9;
-  object-fit: contain;
+  min-height: 180px;
   border: 1px solid var(--line);
   border-radius: 18px;
-  background: #101617;
+  background:
+    linear-gradient(180deg, rgba(20, 27, 28, 0.96), rgba(25, 34, 35, 0.98));
+  overflow: hidden;
+}
+
+.snapshot-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.snapshot-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  text-align: center;
+  color: rgba(241, 245, 242, 0.76);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+
+.snapshot-slot.is-ready .snapshot-empty {
+  display: none;
+}
+
+.snapshot-slot-meta {
+  color: var(--muted);
+  text-align: center;
 }
 
 @media (max-width: 900px) {
@@ -848,6 +881,73 @@ h3 {
 .recording-list {
   display: grid;
   gap: 12px;
+}
+
+.recording-list {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.64);
+  align-content: start;
+}
+
+.recording-workspace {
+  display: grid;
+  gap: 16px;
+}
+
+.recording-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.25fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.recording-controls,
+.recording-selection,
+.recording-policy {
+  display: grid;
+  gap: 12px;
+}
+
+.recording-policy {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.recording-selection {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.recording-selection .stacked-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.recording-selection .checkbox-field {
+  min-height: 100%;
+  align-items: flex-start;
+}
+
+.recording-selection-head {
+  display: grid;
+  gap: 4px;
+}
+
+.recording-selection-head span {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.recording-selection-head small {
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .compact-select {
@@ -964,7 +1064,7 @@ pre {
   }
 
   .compact-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .hero-grid,
@@ -1020,7 +1120,12 @@ pre {
   .metric-grid,
   .status-grid,
   .form-grid,
-  .ocr-results {
+  .ocr-results,
+  .recording-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .recording-selection .stacked-options {
     grid-template-columns: 1fr;
   }
 
