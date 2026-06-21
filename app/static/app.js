@@ -35,6 +35,8 @@ const profileFields = [
   "auto_align_max_offset",
   "auto_align_debug_override",
   "schedule_enabled",
+  "schedule_recording_enabled",
+  "schedule_selected_event_ids",
   "schedule_pre_minutes",
   "schedule_duration_minutes",
   "schedule_post_minutes",
@@ -169,6 +171,10 @@ function profileFromForm() {
   const profile = {};
   for (const name of profileFields) {
     const el = form.elements[name];
+    if (name === "schedule_selected_event_ids") {
+      profile[name] = selectedScheduleEventIdsFromDom();
+      continue;
+    }
     if (!el) continue;
     if (["video_fallbacks", "audio_fallbacks"].includes(name)) {
       profile[name] = el.value
@@ -257,6 +263,38 @@ function updateRecordingStatus(recording) {
   root.textContent = `${active.label || active.session_id} · ${state}${merge}${segs}`;
 }
 
+function selectedScheduleEventIdsFromDom() {
+  return Array.from(document.querySelectorAll('input[name="schedule_selected_event_ids"]:checked'))
+    .map((el) => String(el.value || "").trim())
+    .filter(Boolean);
+}
+
+function renderScheduleMatchPicker(schedule = {}) {
+  const root = document.querySelector("#scheduleMatchPicker");
+  if (!root) return;
+  root.innerHTML = "";
+  const matches = Array.isArray(schedule.upcoming_matches) ? schedule.upcoming_matches : [];
+  if (!matches.length) {
+    root.textContent = "今明两天暂无可选比赛。";
+    return;
+  }
+  const selectedIds = new Set(Array.isArray(schedule.selected_event_ids) ? schedule.selected_event_ids : []);
+  matches.forEach((match) => {
+    const label = document.createElement("label");
+    label.className = "field full checkbox-field";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.name = "schedule_selected_event_ids";
+    input.value = match.event_id || "";
+    input.checked = selectedIds.size ? selectedIds.has(match.event_id) : Boolean(match.selected);
+    const text = document.createElement("span");
+    const start = match.window_start ? match.window_start.replace("T", " ") : "";
+    text.textContent = `${match.short_name || match.name || "-"} ${start}`;
+    label.append(input, text);
+    root.append(label);
+  });
+}
+
 function updateStatus(status) {
   if (!loadedOnce) {
     fillForm(status.profile || {});
@@ -305,6 +343,7 @@ function updateStatus(status) {
   document.querySelector("#lastSnapshotTime").textContent = status.last_snapshot_at || "-";
   renderOcrResults(status);
   const schedule = status.schedule || {};
+  renderScheduleMatchPicker(schedule);
   const scheduleEl = document.querySelector("#scheduleStatus");
   scheduleEl.textContent = schedule.enabled ? (schedule.active ? "比赛窗口" : "等待比赛") : "关闭";
   scheduleEl.style.color = schedule.enabled && schedule.active ? "var(--ok)" : "inherit";
@@ -571,6 +610,29 @@ function renderRecordings(items) {
       }
     });
     actions.append(exportBtn);
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.className = "secondary";
+    deleteBtn.textContent = "删除";
+    if (["starting", "running", "stopping"].includes(String(item.status || ""))) {
+      deleteBtn.disabled = true;
+      deleteBtn.title = "运行中的录制不能删除";
+    }
+    deleteBtn.addEventListener("click", async () => {
+      if (!window.confirm(`确认删除录制“${item.label || item.session_id || "未命名"}”吗？`)) return;
+      try {
+        await api("/api/recording/delete", {
+          method: "POST",
+          body: JSON.stringify({ session_id: item.session_id }),
+        });
+        await loadRecordings();
+        showToast("录制已删除");
+      } catch (e) {
+        showToast(e.message);
+      }
+    });
+    actions.append(deleteBtn);
 
     row.append(meta, actions);
     root.append(row);

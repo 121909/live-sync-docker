@@ -286,6 +286,8 @@ def make_default_profile():
         "auto_align_debug_override": env_bool("AUTO_ALIGN_DEBUG_OVERRIDE", False),
         "snapshot_interval": auto_align_interval,
         "schedule_enabled": env_bool("SCHEDULE_ENABLED", True),
+        "schedule_recording_enabled": env_bool("SCHEDULE_RECORDING_ENABLED", False),
+        "schedule_selected_event_ids": env_list("SCHEDULE_SELECTED_EVENT_IDS"),
         "schedule_provider": env("SCHEDULE_PROVIDER", "espn"),
         "schedule_league": env("SCHEDULE_LEAGUE", "fifa.world"),
         "schedule_timezone": env("SCHEDULE_TIMEZONE", "Asia/Shanghai"),
@@ -555,6 +557,8 @@ RUNTIME_AUTO_ALIGN_KEYS = {
     "auto_align_max_offset",
     "auto_align_debug_override",
     "schedule_enabled",
+    "schedule_recording_enabled",
+    "schedule_selected_event_ids",
     "schedule_provider",
     "schedule_league",
     "schedule_timezone",
@@ -1233,6 +1237,10 @@ class LiveManager:
         merged["auto_align_debug_override"] = parse_bool(merged.get("auto_align_debug_override", DEFAULT_PROFILE["auto_align_debug_override"]))
         merged["snapshot_interval"] = merged["auto_align_interval"]
         merged["schedule_enabled"] = parse_bool(merged.get("schedule_enabled", DEFAULT_PROFILE["schedule_enabled"]))
+        merged["schedule_recording_enabled"] = parse_bool(merged.get("schedule_recording_enabled", DEFAULT_PROFILE.get("schedule_recording_enabled", False)))
+        merged["schedule_selected_event_ids"] = [
+            str(x).strip() for x in (merged.get("schedule_selected_event_ids", []) or []) if str(x).strip()
+        ]
         merged["schedule_provider"] = coerce_text(merged.get("schedule_provider"), DEFAULT_PROFILE["schedule_provider"])
         merged["schedule_league"] = coerce_text(merged.get("schedule_league"), DEFAULT_PROFILE["schedule_league"])
         merged["schedule_timezone"] = coerce_text(merged.get("schedule_timezone"), DEFAULT_PROFILE["schedule_timezone"])
@@ -3380,11 +3388,13 @@ class LiveManager:
         events = list(self.schedule_events)
         active = None
         for event in events:
-            if event.start_ts <= now_ts <= event.end_ts:
+            if event.start_ts <= now_ts <= event.end_ts and self._schedule_event_enabled(event, profile):
                 active = event
                 break
         next_match = None
         for event in events:
+            if not self._schedule_event_enabled(event, profile):
+                continue
             if event.end_ts >= now_ts:
                 if active and event.event_id == active.event_id:
                     continue
@@ -3409,6 +3419,8 @@ class LiveManager:
             "message": self.status.get("schedule", {}).get("message", ""),
             "manual_override": bool(self.manual_override_until_event_id),
             "owned_run": bool(self.schedule_owned_run),
+            "selected_event_ids": sorted(self._schedule_selected_event_ids(profile)),
+            "upcoming_matches": self._schedule_upcoming_matches(profile),
         }
 
     def _auto_align_allowed_by_schedule(self, profile):
@@ -3482,6 +3494,7 @@ class LiveManager:
             if not running and not blocked:
                 self.log(f"schedule: starting for {active.short_name}")
                 self.start(source="schedule")
+                self._ensure_schedule_recording_started()
             elif blocked:
                 with self.lock:
                     self.status["schedule"]["message"] = f"manual stop holds until {active.short_name} window ends"
@@ -3493,6 +3506,7 @@ class LiveManager:
             owned = self.schedule_owned_run
         if running and owned:
             self.log("schedule: stopping outside match window")
+            self._ensure_schedule_recording_stopped()
             self.stop(source="schedule")
 
     def warm_channel_cache(self):
@@ -4792,6 +4806,74 @@ class LiveManager:
             session = self.recording_session
             return {"ok": True, "recording": session.as_dict() if session else None}
 
+    def _schedule_recording_enabled(self, profile=None):
+        current = profile or self.get_profile()
+        return parse_bool(current.get("schedule_recording_enabled", DEFAULT_PROFILE.get("schedule_recording_enabled", False)))
+
+    def _schedule_selected_event_ids(self, profile=None):
+        current = profile or self.get_profile()
+        return {
+            str(item).strip()
+            for item in (current.get("schedule_selected_event_ids", []) or [])
+            if str(item).strip()
+        }
+
+    def _schedule_upcoming_matches(self, profile):
+        tz = self._schedule_tz(profile)
+        today = datetime.now(tz).date()
+        tomorrow = today + timedelta(days=1)
+        items = []
+        selected = self._schedule_selected_event_ids(profile)
+        for match in list(self.schedule_events):
+            start = datetime.fromtimestamp(match.start_ts, timezone.utc).astimezone(tz)
+            end = datetime.fromtimestamp(match.end_ts, timezone.utc).astimezone(tz)
+            if start.date() not in {today, tomorrow} and end.date() not in {today, tomorrow}:
+                continue
+            items.append({
+                "event_id": match.event_id,
+                "name": match.name,
+                "short_name": match.short_name,
+                "window_start": start.isoformat(timespec="minutes"),
+                "window_end": end.isoformat(timespec="minutes"),
+                "state": match.state,
+                "selected": match.event_id in selected,
+            })
+        return items
+
+    def _schedule_event_enabled(self, match, profile):
+        if not match:
+            return False
+        selected = self._schedule_selected_event_ids(profile)
+        if not selected:
+            return True
+        return match.event_id in selected
+
+    def _ensure_schedule_recording_started(self):
+        if not self._schedule_recording_enabled():
+            return
+        with self.recording_lock:
+            session = self.recording_session
+            if session and session.status in {"starting", "running", "stopping"}:
+                return
+        try:
+            self.start_recording({"label": self.status.get("active_channel") or self.get_profile().get("channel_name") or "schedule recording"})
+            self.log("schedule: recording started")
+        except Exception as exc:
+            self.log(f"schedule: recording start skipped: {exc}")
+
+    def _ensure_schedule_recording_stopped(self):
+        if not self._schedule_recording_enabled():
+            return
+        with self.recording_lock:
+            session = self.recording_session
+            if not session or session.status not in {"starting", "running", "stopping"}:
+                return
+        try:
+            self.stop_recording()
+            self.log("schedule: recording stopped")
+        except Exception as exc:
+            self.log(f"schedule: recording stop skipped: {exc}")
+
     def merge_recording(self, session_id, output_format="mkv"):
         session_id = str(session_id or "").strip()
         if not session_id:
@@ -4828,6 +4910,25 @@ class LiveManager:
                 self.recording_session = merged_session
         self._save_recording_meta(merged_session)
         return {"ok": True, "recording": merged_session.as_dict()}
+
+    def delete_recording(self, session_id):
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            raise RuntimeError("missing session_id")
+        session_dir = self._recording_dir(session_id)
+        if not session_dir.exists():
+            raise RuntimeError("recording does not exist")
+        with self.recording_lock:
+            active = self.recording_session
+            if active and active.session_id == session_id and active.status in {"starting", "running", "stopping"}:
+                raise RuntimeError("recording is still running")
+        shutil.rmtree(session_dir, ignore_errors=False)
+        with self.recording_lock:
+            active = self.recording_session
+            if active and active.session_id == session_id:
+                self.recording_session = None
+        self.log(f"recording deleted: {session_id}")
+        return {"ok": True, "session_id": session_id}
 
     def _recording_worker(self, session):
         session_dir = self._recording_dir(session.session_id)
@@ -4997,6 +5098,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(MANAGER.stop_recording())
             if path == "/api/recording/merge":
                 return self.send_json(MANAGER.merge_recording(data.get("session_id", ""), data.get("output_format", "mkv")))
+            if path == "/api/recording/delete":
+                return self.send_json(MANAGER.delete_recording(data.get("session_id", "")))
             if path == "/api/clear":
                 return self.send_json(MANAGER.clear_runtime(data.get("target", "")))
         except Exception as exc:
