@@ -30,6 +30,23 @@ from typing import Any
 
 import cv2
 import numpy as np
+from rapidocr_onnxruntime import RapidOCR
+
+from .auto_align import (
+    ALIGN_FRAME_LIVE_START_INDEX,
+    ALIGN_MAX_CAPTURE_SKEW_SECONDS,
+    ALIGN_MAX_FINISH_DELTA_SECONDS,
+    ALIGN_RETRY_BACKOFF_BASE_SECONDS,
+    ALIGN_RETRY_BACKOFF_MAX_SECONDS,
+    ALIGN_STATE_CAPTURE_FAILED,
+    ALIGN_STATE_DISABLED,
+    ALIGN_STATE_ALIGNED,
+    ALIGN_STATE_PROBING,
+    ALIGN_STATE_VERIFYING,
+    ALIGN_STATE_WAITING,
+    AlignmentMonitor,
+    AutoAlignController,
+)
 
 
 def app_root():
@@ -55,9 +72,7 @@ PORT = int(os.environ.get("PORT", "18080"))
 OFFSET_STATE = Path(os.environ.get("OFFSET_STATE", str(STATE_DIR / "last_sync_offset.json")))
 
 PROFILE_PATH = STATE_DIR / "profile.json"
-ROI_PATH = STATE_DIR / "roi.json"
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
-ROI_PREVIEW_DIR = STATE_DIR / "roi_previews"
 RECORDING_DIR = STATE_DIR / "recordings"
 SNAPSHOT_KINDS = ("cache_video", "cache_audio", "video", "audio")
 OCR_NO_SCOREBOARD = object()
@@ -74,18 +89,26 @@ ADDED_LINE_RE = re.compile(r"^\+?([0-9]{1,2})(?:[:：.]([0-9]{2}))?$")
 ELAPSED_ADDED_TIME_RE = re.compile(r"(?<![+\d])([0-9]{1,2})[:：.]([0-5][0-9])(?:\+[0-9]{1,2})?(?!\d)")
 ADJACENT_STOPPAGE_BASES = {45, 90, 105, 120}
 HLS_MAP_URI_RE = re.compile(r'URI="([^"]+)"')
-DEFAULT_VIDEO_TIMER_ROI_PRESETS = "\n".join([
-    "0.132,0.055,0.078,0.140",
-    "0.333,0.058,0.080,0.140",
-    "0.114,0.049,0.077,0.077",
-    "0.111,0.000,0.077,0.185",
-])
-DEFAULT_AUDIO_TIMER_ROI_PRESETS = "0.824,0.080,0.078,0.140"
-TIMER_ROI_SCAN_INTERVAL_SECONDS = 60
-TIMER_ROI_SCAN_WINDOW_SECONDS = 300
-TIMER_ROI_PREVIEW_MULTIPLIER = 9.0
+HLS_EXTINF_RE = re.compile(r"^#EXTINF:([0-9.]+)")
+RAPIDOCR_CONFIG_PATH = APP_ROOT / "configs" / "ocr" / "rapidocr_timer.yaml"
+RAPIDOCR_PRESET_ROIS = (
+    (0.02, 0.02, 0.42, 0.36),
+    (0.02, 0.02, 0.40, 0.50),
+    (0.60, 0.02, 0.38, 0.44),
+    (0.60, 0.04, 0.36, 0.52),
+)
+TIMER_TEXT_PATTERNS = [
+    re.compile(r"(?<!\d)(\d{1,3}:\d{2}\+\d{1,2}:\d{2})(?!\d)"),
+    re.compile(r"(?<!\d)(\d{1,3}:\d{2}\+\d{1,2})(?!\d)"),
+    re.compile(r"(?<!\d)(\d{1,3}:\d{2})(?!\d)"),
+]
 HLS_RECOVERY_WINDOW_SECONDS = int(os.environ.get("HLS_RECOVERY_WINDOW_SECONDS", "300") or 300)
 HLS_CLIENT_GRACE_SECONDS = int(os.environ.get("HLS_CLIENT_GRACE_SECONDS", "240") or 240)
+FFMPEG_STABLE_THREAD_QUEUE_SIZE = 4096
+FFMPEG_FAST_THREAD_QUEUE_SIZE = 512
+FFMPEG_FAST_TIMEOUT_CAP_SECONDS = 10
+FFMPEG_FAST_RECONNECT_DELAY_MAX_SECONDS = 2
+ALIGN_CAPTURE_ANCHOR_MARGIN_SECONDS = 0.75
 
 
 def env(name, default=""):
@@ -250,6 +273,7 @@ def make_default_profile():
         "hls_segment_type": env("HLS_SEGMENT_TYPE", "auto").lower(),
         "local_cache_enabled": env_bool("LOCAL_CACHE_ENABLED", True),
         "local_cache_seconds": int(env("LOCAL_CACHE_SECONDS", "96") or 96),
+        "debug_cache_delay_seconds": float(env("DEBUG_CACHE_DELAY_SECONDS", "0") or 0),
         "public_base_url": env("PUBLIC_BASE_URL", ""),
         "channel_id": env("CHANNEL_ID", "cctv5-4k-cn"),
         "channel_name": env("CHANNEL_NAME", "CCTV5 4K Chinese"),
@@ -257,17 +281,10 @@ def make_default_profile():
         "channel_group": env("CHANNEL_GROUP", "Sports"),
         "auto_align_enabled": False,
         "auto_align_interval": auto_align_interval,
-        "auto_align_samples": int(env("AUTO_ALIGN_SAMPLES", "3") or 3),
-        "auto_align_step": float(env("AUTO_ALIGN_STEP", "1") or 1),
         "auto_align_threshold": float(env("AUTO_ALIGN_THRESHOLD", "1") or 1),
         "auto_align_max_offset": float(env("AUTO_ALIGN_MAX_OFFSET", "180") or 180),
-        "auto_align_relocate_attempts": int(env("AUTO_ALIGN_RELOCATE_ATTEMPTS", "3") or 3),
         "auto_align_debug_override": env_bool("AUTO_ALIGN_DEBUG_OVERRIDE", False),
         "snapshot_interval": auto_align_interval,
-        "video_roi": env("VIDEO_TIMER_ROI", "0.050,0.050,0.070,0.050"),
-        "audio_roi": env("AUDIO_TIMER_ROI", "0.885,0.085,0.075,0.060"),
-        "video_roi_presets": env("VIDEO_TIMER_ROI_PRESETS", "").strip() or DEFAULT_VIDEO_TIMER_ROI_PRESETS,
-        "audio_roi_presets": env("AUDIO_TIMER_ROI_PRESETS", "").strip() or DEFAULT_AUDIO_TIMER_ROI_PRESETS,
         "schedule_enabled": env_bool("SCHEDULE_ENABLED", True),
         "schedule_provider": env("SCHEDULE_PROVIDER", "espn"),
         "schedule_league": env("SCHEDULE_LEAGUE", "fifa.world"),
@@ -376,7 +393,7 @@ def effective_hls_segment_type(profile, prepared=None):
     configured = hls_segment_type(profile)
     if configured != "auto":
         return configured
-    return "fmp4" if prepared and prepared.channel_prefers_fmp4 else "mpegts"
+    return "mpegts"
 
 
 def effective_hls_segment_ext(profile, prepared=None):
@@ -476,7 +493,6 @@ OCR_PROVIDER_LABELS = {
     "ocrspace": "OCR.space",
     "custom": "自定义 OCR",
 }
-OCR_FALLBACK_COOLDOWN_SECONDS = int(os.environ.get("OCR_FALLBACK_COOLDOWN_SECONDS", "180") or 180)
 
 
 def normalize_ocr_provider(value):
@@ -485,7 +501,7 @@ def normalize_ocr_provider(value):
 
 
 def ocr_provider_ready(profile):
-    return any(ocr_provider_ready_for(provider, profile) for provider in ocr_provider_order(profile))
+    return rapidocr_available() or any(ocr_provider_ready_for(provider, profile) for provider in ocr_provider_order(profile))
 
 
 def ocr_provider_ready_for(provider, profile):
@@ -521,6 +537,10 @@ def ocr_provider_label(provider):
     return OCR_PROVIDER_LABELS.get(normalize_ocr_provider(provider), provider or "")
 
 
+def rapidocr_available():
+    return RAPIDOCR_CONFIG_PATH.exists()
+
+
 DEFAULT_PROFILE = make_default_profile()
 DEFAULT_PROFILE["auto_align_enabled"] = ocr_provider_ready(DEFAULT_PROFILE)
 
@@ -531,16 +551,9 @@ URL_SAVE_KEYS = {
 }
 RUNTIME_AUTO_ALIGN_KEYS = {
     "auto_align_interval",
-    "auto_align_samples",
-    "auto_align_step",
     "auto_align_threshold",
     "auto_align_max_offset",
-    "auto_align_relocate_attempts",
     "auto_align_debug_override",
-    "video_roi",
-    "audio_roi",
-    "video_roi_presets",
-    "audio_roi_presets",
     "schedule_enabled",
     "schedule_provider",
     "schedule_league",
@@ -557,17 +570,45 @@ def local_cache_enabled(profile):
     return parse_bool(profile.get("local_cache_enabled", DEFAULT_PROFILE.get("local_cache_enabled", True)))
 
 
+LOCAL_CACHE_MAX_SECONDS = 600
+
+
 def effective_local_cache_seconds(profile):
     segment = effective_segment_time(profile)
     configured = coerce_int(profile.get("local_cache_seconds"), DEFAULT_PROFILE["local_cache_seconds"], minimum=30)
     offset = abs(coerce_float(profile.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"]))
-    # Keep enough cache for smooth handoff, but cap growth so long-running
-    # sessions do not accumulate multi-hundred-MB source caches per side.
-    return int(math.ceil(min(configured, max(30, min(offset + segment * 3, 120)))))
+    # Honor the configured cache depth so upstream jitter/short stalls are
+    # absorbed locally instead of starving the mux. Keep at least what the
+    # handoff needs (offset + a few segments), and cap at an absolute ceiling
+    # so a long session cannot accumulate an unbounded source cache.
+    needed = max(configured, offset + segment * 3)
+    return int(math.ceil(min(needed, LOCAL_CACHE_MAX_SECONDS)))
 
 
 def local_cache_list_size(profile):
     return max(8, int(math.ceil(effective_local_cache_seconds(profile) / effective_segment_time(profile))) + 4)
+
+
+def debug_cache_delay_seconds(profile):
+    return coerce_float(profile.get("debug_cache_delay_seconds"), DEFAULT_PROFILE.get("debug_cache_delay_seconds", 0.0))
+
+
+def local_cache_delay_for_kind(profile, kind):
+    delay = debug_cache_delay_seconds(profile)
+    if kind == "video":
+        return max(0.0, delay)
+    if kind == "audio":
+        return max(0.0, -delay)
+    return 0.0
+
+
+def local_cache_live_start_index(profile, kind):
+    delay = local_cache_delay_for_kind(profile, kind)
+    if delay <= 0:
+        return -1
+    segment = max(effective_segment_time(profile), 0.5)
+    segments_back = max(1, int(math.ceil(delay / segment)))
+    return -(segments_back + 1)
 
 
 def _strip_url_fields(profile):
@@ -578,6 +619,29 @@ def _redact_url(text):
         return str(text or "")
     return re.sub(r"https?://[^\s\"'<>)]+", "<URL>", str(text or ""))
 
+
+def _subprocess_error_summary(exc, *, max_lines=3):
+    detail = str(exc).strip()
+    stderr = ""
+    stdout = ""
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = str(exc.stderr or "").strip()
+        stdout = str(exc.stdout or "").strip()
+        detail = f"exit code {exc.returncode}"
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        stderr = str(exc.stderr or "").strip()
+        stdout = str(exc.stdout or "").strip()
+        timeout = exc.timeout
+        detail = f"timed out after {timeout}s" if timeout is not None else "timed out"
+    lines = []
+    for text in (stderr, stdout):
+        if not text:
+            continue
+        lines.extend(part.strip() for part in text.splitlines() if part.strip())
+    if lines:
+        tail = " || ".join(_redact_url(line) for line in lines[-max_lines:])
+        return f"{detail} | probe output: {tail}"
+    return _redact_url(detail)
 
 
 def clear_directory_contents(path, *, keep=()):
@@ -590,6 +654,9 @@ def clear_directory_contents(path, *, keep=()):
             shutil.rmtree(item, ignore_errors=True)
         else:
             item.unlink(missing_ok=True)
+
+
+PACKET_CORRUPT_RE = re.compile(r"Packet corrupt \(stream = ([0-9]+), dts = ([0-9-]+)\), dropping it\.", re.IGNORECASE)
 
 
 def safe_child_path(root, relative_path):
@@ -621,6 +688,14 @@ class ClockSample:
     game_time: int
     text: str
     roi: tuple | None = None
+    provider: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class OcrProviderResult:
+    value: object | None = None
+    request_failed: bool = False
 
 
 def coerce_clock_sample(found, media_time=0.0):
@@ -629,17 +704,13 @@ def coerce_clock_sample(found, media_time=0.0):
     if isinstance(found, ClockSample):
         if found.media_time == media_time:
             return found
-        return ClockSample(media_time, found.game_time, found.text, found.roi)
-    return ClockSample(media_time, found[0], found[1], found[2])
-
-
-@dataclass(frozen=True)
-class ClockCandidate:
-    diff: float
-    offset: float
-    video: ClockSample
-    audio: ClockSample
-
+        return ClockSample(media_time, found.game_time, found.text, found.roi, found.provider, found.note)
+    if isinstance(found, (list, tuple)):
+        roi = found[2] if len(found) > 2 else None
+        provider = found[3] if len(found) > 3 else ""
+        note = found[4] if len(found) > 4 else ""
+        return ClockSample(media_time, found[0], found[1], roi, provider, note)
+    return None
 
 @dataclass(frozen=True)
 class FrameCaptureResult:
@@ -649,6 +720,8 @@ class FrameCaptureResult:
     finished_at: float
     media_time: float = 0.0
     source: str = ""
+    anchor_time: float = 0.0
+    seconds_back: float = 0.0
 
 
 class HandoffDeferred(RuntimeError):
@@ -662,6 +735,13 @@ class LocalSourceCache:
     audio: Channel
     video_proc: object | None = None
     audio_proc: object | None = None
+
+
+@dataclass(frozen=True)
+class PlaylistProgramWindow:
+    start_time: float
+    end_time: float
+    segment_count: int
 
 
 @dataclass(frozen=True)
@@ -698,32 +778,6 @@ class ClockParse:
     game_time: int
     text: str
     kind: str = "clock"
-
-
-@dataclass
-class AlignmentMonitor:
-    video_clock: str = ""
-    audio_clock: str = ""
-    state: str = "acquiring"
-    message: str = "waiting for OCR"
-    mismatch_offsets: list = field(default_factory=list)
-    mismatch_count: int = 0
-    checks: int = 0
-    video_missing_count: int = 0
-    audio_missing_count: int = 0
-
-    def locked(self):
-        return True
-
-    def snapshot(self):
-        return {
-            "state": self.state,
-            "message": self.message,
-            "mismatch_count": self.mismatch_count,
-            "checks": self.checks,
-            "video_clock": self.video_clock,
-            "audio_clock": self.audio_clock,
-        }
 
 
 @dataclass(frozen=True)
@@ -997,7 +1051,6 @@ class LiveManager:
         self.profile = self.normalize_profile(self.profile, save=False)
         if PROFILE_PATH.exists():
             json_save(PROFILE_PATH, _strip_url_fields(self.profile))
-        self.roi = json_load(ROI_PATH, {})
         self.thread = None
         self.stop_event = threading.Event()
         self.processes = []
@@ -1006,6 +1059,7 @@ class LiveManager:
         self.snapshot_lock = threading.Lock()
         self.snapshot_file_lock = threading.Lock()
         self.ocr_lock = threading.Lock()
+        self.rapidocr_engine = None
         self.schedule_thread = None
         self.schedule_stop_event = threading.Event()
         self.schedule_events = []
@@ -1022,7 +1076,7 @@ class LiveManager:
         self.hls_preserved_assets = deque(maxlen=16)
         self.managed_pidfile = STATE_DIR / "live_manager.pid"
         self.restart_request_id = 0
-        self.ocr_provider_cooldowns = {}
+        self._auto_align_source_cache = None
         self.status = {
             "running": False,
             "stage": "stopped",
@@ -1044,6 +1098,7 @@ class LiveManager:
             "auto_align_offset_seconds": None,
             "last_snapshot_at": None,
             "last_ocr_results": {kind: None for kind in SNAPSHOT_KINDS},
+            "last_ocr_diagnostic": {},
             "ocr_request_count": 0,
             "ocr_request_last_at": None,
             "ocr_request_last_provider": "",
@@ -1170,13 +1225,11 @@ class LiveManager:
         merged["hls_segment_type"] = hls_segment_type(merged)
         merged["local_cache_enabled"] = parse_bool(merged.get("local_cache_enabled", DEFAULT_PROFILE["local_cache_enabled"]))
         merged["local_cache_seconds"] = coerce_int(merged.get("local_cache_seconds"), DEFAULT_PROFILE["local_cache_seconds"], minimum=30)
+        merged["debug_cache_delay_seconds"] = max(0.0, coerce_float(merged.get("debug_cache_delay_seconds"), DEFAULT_PROFILE.get("debug_cache_delay_seconds", 0.0)))
         interval_value = raw_profile.get("auto_align_interval", raw_profile.get("snapshot_interval", merged.get("auto_align_interval")))
         merged["auto_align_interval"] = coerce_int(interval_value, DEFAULT_PROFILE["auto_align_interval"], minimum=60)
-        merged["auto_align_samples"] = coerce_int(merged.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"], minimum=3)
-        merged["auto_align_step"] = coerce_float(merged.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"], minimum=0.5)
         merged["auto_align_threshold"] = coerce_float(merged.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
         merged["auto_align_max_offset"] = coerce_float(merged.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"], minimum=1)
-        merged["auto_align_relocate_attempts"] = coerce_int(merged.get("auto_align_relocate_attempts"), DEFAULT_PROFILE["auto_align_relocate_attempts"], minimum=0)
         merged["auto_align_debug_override"] = parse_bool(merged.get("auto_align_debug_override", DEFAULT_PROFILE["auto_align_debug_override"]))
         merged["snapshot_interval"] = merged["auto_align_interval"]
         merged["schedule_enabled"] = parse_bool(merged.get("schedule_enabled", DEFAULT_PROFILE["schedule_enabled"]))
@@ -1198,10 +1251,6 @@ class LiveManager:
         merged.pop("align_only_during_match", None)
         merged.pop("auto_align_stop_after_aligned", None)
         merged.pop("snapshot_interval", None)
-        merged.pop("video_roi", None)
-        merged.pop("audio_roi", None)
-        merged.pop("video_roi_presets", None)
-        merged.pop("audio_roi_presets", None)
         if save:
             json_save(PROFILE_PATH, _strip_url_fields(merged))
         return merged
@@ -1236,11 +1285,8 @@ class LiveManager:
                 "active_allowed": self._auto_align_allowed_by_schedule(aa),
                 "debug_override": parse_bool(aa.get("auto_align_debug_override", DEFAULT_PROFILE["auto_align_debug_override"])),
                 "interval": coerce_int(aa.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"]),
-                "samples": coerce_int(aa.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"]),
-                "step": coerce_float(aa.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"]),
                 "threshold": coerce_float(aa.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"]),
                 "max_offset": coerce_float(aa.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"]),
-                "relocate_attempts": coerce_int(aa.get("auto_align_relocate_attempts"), DEFAULT_PROFILE["auto_align_relocate_attempts"], minimum=0),
                 "snapshot_interval": coerce_int(aa.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"]),
             }
             status["auto_align_state"] = self.status.get("auto_align_state", "idle")
@@ -1329,9 +1375,25 @@ class LiveManager:
             self.status["auto_align_state"] = "idle"
             self.status["auto_align_monitor"] = {}
             self.current_snapshot_jobs = []
+            self._auto_align_source_cache = None
         self.log(f"live pipeline stopped ({source})")
 
-    def restart(self, profile=None, source="manual"):
+    def _clear_stream_pipeline(self):
+        self._clear_hls()
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        clear_directory_contents(SNAPSHOT_DIR)
+        with self.lock:
+            self.current_snapshot_jobs = []
+            self._auto_align_source_cache = None
+            self.status["last_segment_at"] = None
+            self.status["last_snapshot_at"] = None
+            self.status["last_ocr_results"] = {kind: None for kind in SNAPSHOT_KINDS}
+            self.status["auto_align_state"] = "idle"
+            self.status["auto_align_monitor"] = {}
+        self.log("cleared stream pipeline runtime")
+
+    def restart(self, profile=None, source="manual", clean=False):
         if profile:
             self.set_profile(profile)
         with self.lock:
@@ -1342,19 +1404,24 @@ class LiveManager:
             thread = self.thread
             if self.thread and self.thread.is_alive():
                 self.status["stage"] = "restarting"
-                self.log(f"restart queued ({source}): waiting for previous pipeline to stop")
+                if clean:
+                    self.log(f"clean restart queued ({source}): waiting for previous pipeline to stop")
+                else:
+                    self.log(f"restart queued ({source}): waiting for previous pipeline to stop")
                 threading.Thread(
                     target=self._restart_when_stopped,
-                    args=(request_id, source),
+                    args=(request_id, source, clean),
                     name="live-sync-restart-waiter",
                     daemon=True,
                 ).start()
                 return
             if self.thread and not self.thread.is_alive():
                 self.thread = None
+        if clean:
+            self._clear_stream_pipeline()
         self.start(source=source)
 
-    def _restart_when_stopped(self, request_id, source):
+    def _restart_when_stopped(self, request_id, source, clean=False):
         while True:
             with self.lock:
                 if request_id != self.restart_request_id:
@@ -1368,6 +1435,8 @@ class LiveManager:
                 return
             if self.thread and not self.thread.is_alive():
                 self.thread = None
+        if clean:
+            self._clear_stream_pipeline()
         self.start(source=source)
 
     def _resolve_audio_channel(self, profile, audio_sources, force=False):
@@ -1514,6 +1583,14 @@ class LiveManager:
         threading.Thread(target=self._read_stderr, args=(proc, name, context), daemon=True).start()
         return proc
 
+    def _format_ffmpeg_stderr_line(self, line):
+        text = _redact_url(line)
+        match = PACKET_CORRUPT_RE.search(text)
+        if match:
+            stream_idx, dts = match.groups()
+            return f"上游 TS 包损坏，已丢弃后继续 (stream={stream_idx}, dts={dts})"
+        return text
+
     def _read_stderr(self, proc, name, context=""):
         if not proc.stderr:
             return
@@ -1524,7 +1601,7 @@ class LiveManager:
                     tail = self.process_tails.get(proc.pid)
                     if tail is not None:
                         tail.append(line)
-                self.log(f"{name}: {_redact_url(line)}")
+                self.log(f"{name}: {self._format_ffmpeg_stderr_line(line)}")
                 context_patterns = (
                     "expired from playlists",
                     "HTTP error 403",
@@ -1699,7 +1776,7 @@ class LiveManager:
             raise RuntimeError("stopped")
         raise RuntimeError(f"{label} playlist was not created")
 
-    def _http_input_options(self, url, headers=None):
+    def _http_input_options(self, url, headers=None, *, reconnect_delay_max=10):
         if not str(url or "").lower().startswith(("http://", "https://")):
             return []
         headers = {**default_request_headers(), **dict(headers or {})}
@@ -1710,7 +1787,7 @@ class LiveManager:
             "-reconnect", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "10",
+            "-reconnect_delay_max", str(reconnect_delay_max),
         ]
         if urlsplit(str(url)).path.lower().endswith(".m3u8"):
             args += ["-http_persistent", "0", "-live_start_index", "-1"]
@@ -1726,6 +1803,44 @@ class LiveManager:
         if text.startswith(("http://", "https://")) or not text.endswith(".m3u8"):
             return []
         return ["-live_start_index", str(live_start_index)]
+
+    def _ffmpeg_input_args(self, url, timeout, headers=None, live_start_index=None, *, thread_queue_size=FFMPEG_STABLE_THREAD_QUEUE_SIZE, reconnect_delay_max=10, timeout_cap=None):
+        timeout = coerce_int(timeout, DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        if timeout_cap is not None:
+            timeout = min(timeout, int(timeout_cap))
+        if live_start_index is None:
+            text = str(url or "").lower()
+            if text.endswith(".m3u8") and not text.startswith(("http://", "https://")):
+                live_start_index = -1
+        return [
+            "-rw_timeout", str(timeout * 1_000_000),
+            *self._http_input_options(url, headers, reconnect_delay_max=reconnect_delay_max),
+            *self._local_hls_input_options(url, live_start_index),
+            "-fflags", "+genpts+discardcorrupt",
+            "-thread_queue_size", str(thread_queue_size),
+            "-i", url,
+        ]
+
+    def _stable_input_args(self, url, timeout, headers=None, live_start_index=None):
+        return self._ffmpeg_input_args(
+            url,
+            timeout,
+            headers,
+            live_start_index=live_start_index,
+            thread_queue_size=FFMPEG_STABLE_THREAD_QUEUE_SIZE,
+            reconnect_delay_max=10,
+        )
+
+    def _fast_input_args(self, url, timeout, headers=None, live_start_index=None):
+        return self._ffmpeg_input_args(
+            url,
+            timeout,
+            headers,
+            live_start_index=live_start_index,
+            thread_queue_size=FFMPEG_FAST_THREAD_QUEUE_SIZE,
+            reconnect_delay_max=FFMPEG_FAST_RECONNECT_DELAY_MAX_SECONDS,
+            timeout_cap=FFMPEG_FAST_TIMEOUT_CAP_SECONDS,
+        )
 
     def _probe_video_codec(self, channel, timeout):
         if not channel or not channel.url:
@@ -1743,7 +1858,8 @@ class LiveManager:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5, check=True)
         except Exception as exc:
-            self.log(f"video codec probe failed for {channel.name}: {exc}; using generic copy path")
+            summary = _subprocess_error_summary(exc)
+            self.log(f"video codec probe failed for {channel.name}: {summary}; using generic copy path")
             return ""
         codec = result.stdout.strip().splitlines()
         return codec[0].strip().lower() if codec else ""
@@ -1764,7 +1880,8 @@ class LiveManager:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5, check=True)
         except Exception as exc:
-            self.log(f"audio stream probe failed for {channel.name}: {exc}; using first audio stream")
+            summary = _subprocess_error_summary(exc)
+            self.log(f"audio stream probe failed for {channel.name}: {summary}; using first audio stream")
             return []
         try:
             data = json.loads(result.stdout or "{}")
@@ -1820,25 +1937,27 @@ class LiveManager:
         segment = f"{effective_segment_time(profile):.3f}"
         list_size = local_cache_list_size(profile)
         segment_name = playlist.parent / f"{kind}_cache_%06d.ts"
+        cache_delay = local_cache_delay_for_kind(profile, kind)
+        cache_live_start = local_cache_live_start_index(profile, kind)
         # Keep a video stream in the audio cache so OCR/snapshot jobs can read
         # the commentary timer frame while mux still maps only the audio stream.
         map_args = ["-map", "0:v:0?", "-map", f"0:a:{int(audio_stream_index)}?"]
+        video_codec = self._probe_video_codec(channel, coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5))
         header_label = f", headers={','.join(channel.headers.keys())}" if channel.headers else ""
         context = (
             f"source={kind} url={channel.url}{header_label}; "
-            f"cache={playlist.name}; seconds={effective_local_cache_seconds(profile)}; copy"
+            f"cache={playlist.name}; seconds={effective_local_cache_seconds(profile)}; "
+            f"debug_delay={cache_delay:.3f}s; live_start_index={cache_live_start}; copy"
         )
         return self._start_process([
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-            "-rw_timeout", str(coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5) * 1_000_000),
-            *self._http_input_options(channel.url, channel.headers),
-            "-fflags", "+discardcorrupt",
-            "-thread_queue_size", "4096", "-i", channel.url,
+            *self._stable_input_args(channel.url, profile.get("timeout_seconds"), channel.headers, live_start_index=cache_live_start),
             *map_args,
-            "-c", "copy",
+            *self._video_copy_args(video_codec),
+            "-c:a", "copy",
             "-f", "hls", "-hls_time", segment, "-hls_list_size", str(list_size),
             "-hls_delete_threshold", "2",
-            "-hls_flags", "delete_segments+omit_endlist+append_list",
+            "-hls_flags", "delete_segments+omit_endlist+append_list+program_date_time",
             "-hls_segment_filename", str(segment_name),
             str(playlist),
         ], f"{kind}-cache", context=context)
@@ -1856,6 +1975,8 @@ class LiveManager:
             video_proc = None
             try:
                 same_source = bool(audio and audio.url) and video.url == audio.url and dict(video.headers) == dict(audio.headers)
+                if abs(debug_cache_delay_seconds(profile)) > 0:
+                    same_source = False
                 source_audio = video if same_source else audio
                 audio_stream_index, _audio_codec = self._select_audio_stream(source_audio, coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)) if source_audio and source_audio.url else (0, "")
                 video_proc = self._start_local_cache_recorder(video, video_playlist, profile, "video", audio_stream_index=audio_stream_index if same_source else 0)
@@ -1874,6 +1995,14 @@ class LiveManager:
                 for playlist, proc, label in waits:
                     self._wait_for_playlist(playlist, proc, wait_timeout, label)
                 self.log("local cache ready: upstream requests are held by cache recorders; mux/snapshot/OCR read local HLS")
+                if abs(debug_cache_delay_seconds(profile)) > 0:
+                    self.log(
+                        f"local cache debug delay active: total={debug_cache_delay_seconds(profile):.3f}s "
+                        f"(video={local_cache_delay_for_kind(profile, 'video'):.3f}s index={local_cache_live_start_index(profile, 'video')}, "
+                        f"audio={local_cache_delay_for_kind(profile, 'audio'):.3f}s index={local_cache_live_start_index(profile, 'audio')})"
+                    )
+                if cached_audio.url and not self._input_has_video_stream(cached_audio.url, coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)):
+                    self.log(f"audio cache has no video stream: {Path(cached_audio.url).name}; audio-side OCR/auto-align unavailable")
                 return LocalSourceCache(cache_dir, cached_video, cached_audio, video_proc, audio_proc)
             except Exception as exc:
                 last_exc = exc
@@ -1901,11 +2030,7 @@ class LiveManager:
         context = f"source={kind} url={url}{header_label}; output={playlist.name}"
         return self._start_process([
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-            "-rw_timeout", str(timeout * 1_000_000),
-            *self._http_input_options(url, channel.headers),
-            *self._local_hls_input_options(url, -1),
-            "-fflags", "+discardcorrupt",
-            "-thread_queue_size", "4096", "-i", url,
+            *self._stable_input_args(url, timeout, channel.headers, live_start_index=-1),
             *stream_args,
             "-f", "hls", "-hls_time", segment, "-hls_list_size", str(list_size),
             "-hls_flags", "delete_segments+omit_endlist+append_list",
@@ -1956,17 +2081,10 @@ class LiveManager:
         raise RuntimeError(f"{stage} produced no segments within timeout")
 
     def _direct_input(self, url, timeout, headers=None, live_start_index=None):
-        if live_start_index is None:
-            text = str(url or "").lower()
-            if text.endswith(".m3u8") and not text.startswith(("http://", "https://")):
-                live_start_index = -1
-        return [
-            "-rw_timeout", str(timeout * 1_000_000),
-            *self._http_input_options(url, headers),
-            *self._local_hls_input_options(url, live_start_index),
-            "-fflags", "+discardcorrupt",
-            "-thread_queue_size", "4096", "-i", url,
-        ]
+        return self._stable_input_args(url, timeout, headers, live_start_index=live_start_index)
+
+    def _snapshot_input(self, url, timeout, headers=None, live_start_index=None):
+        return self._fast_input_args(url, timeout, headers, live_start_index=live_start_index)
 
     def _prepare_pipeline(self, video, audio, profile, run_label, source_cache=None):
         video_url = video.url
@@ -1989,10 +2107,10 @@ class LiveManager:
             str(profile.get("channel_name", "") or ""),
             str(profile.get("video_primary", "") or ""),
         ]).lower()
-        channel_prefers_fmp4 = "4k" in channel_text
+        channel_prefers_fmp4 = False
         configured_segment_type = hls_segment_type(profile)
-        compatible_mux = configured_segment_type == "auto" and not channel_prefers_fmp4
-        mux_segment_type = configured_segment_type if configured_segment_type != "auto" else ("fmp4" if channel_prefers_fmp4 else "mpegts")
+        compatible_mux = configured_segment_type == "auto"
+        mux_segment_type = configured_segment_type if configured_segment_type != "auto" else "mpegts"
         if video_codec:
             mux_mode = "auto mpegts" if compatible_mux else mux_segment_type
             self.log(f"video codec detected: {video_codec}; mux mode: {mux_mode}")
@@ -2025,7 +2143,11 @@ class LiveManager:
         audio_copy_bsf = ""
 
         try:
-            if offset >= 0.5:
+            if 0.5 <= offset < segment_seconds:
+                video_input = self._offset_input_args(video_input, offset)
+                video_input_label = f"input0={source_kind} video ({video_url}{video_header_label}, offset +{offset:.3f}s via itsoffset)"
+                video_snapshot_input = list(video_input)
+            elif offset >= segment_seconds:
                 delay_playlist = run_dir / "video_delay.m3u8"
                 list_size = max(20, int(offset / segment_seconds) + 20)
                 recorder = self._start_delay_recorder(video, delay_playlist, segment, list_size, timeout, "video", video_codec)
@@ -2035,7 +2157,13 @@ class LiveManager:
                 video_input = ["-thread_queue_size", "4096", "-live_start_index", "-1", "-i", str(delay_playlist)]
                 video_input_label = f"input0=local video delay HLS ({delay_playlist.name}, source={video_url}{video_header_label}, offset +{offset:.3f}s)"
                 video_snapshot_input = list(video_input)
-            elif offset <= -0.5:
+            elif -segment_seconds < offset <= -0.5:
+                if not audio_url:
+                    raise RuntimeError("negative offset requires an audio source")
+                audio_input = self._offset_input_args(audio_input, abs(offset))
+                audio_input_label = f"input1={source_kind} audio ({audio_url}{audio_header_label}, offset {offset:.3f}s via itsoffset)"
+                audio_snapshot_input = list(audio_input)
+            elif offset <= -segment_seconds:
                 if not audio_url:
                     raise RuntimeError("negative offset requires an audio source")
                 delay_playlist = run_dir / "audio_delay.m3u8"
@@ -2053,13 +2181,13 @@ class LiveManager:
             raise
 
         if source_cache:
-            snapshot_jobs.append(("cache_video", list(self._direct_input(source_cache.video.url, timeout, video.headers, live_start_index=-1)), f"{video.name} 缓存前"))
+            snapshot_jobs.append(("cache_video", list(self._snapshot_input(source_cache.video.url, timeout, video.headers, live_start_index=ALIGN_FRAME_LIVE_START_INDEX)), f"{video.name} 缓存前"))
             if source_cache.audio and source_cache.audio.url:
-                snapshot_jobs.append(("cache_audio", list(self._direct_input(source_cache.audio.url, timeout, audio.headers, live_start_index=-1)), f"{audio.name} 缓存前"))
+                snapshot_jobs.append(("cache_audio", list(self._snapshot_input(source_cache.audio.url, timeout, audio.headers, live_start_index=ALIGN_FRAME_LIVE_START_INDEX)), f"{audio.name} 缓存前"))
         else:
-            snapshot_jobs.append(("cache_video", list(self._direct_input(video_url, timeout, video.headers)), f"{video.name} 原始"))
+            snapshot_jobs.append(("cache_video", list(self._snapshot_input(video_url, timeout, video.headers)), f"{video.name} 原始"))
             if audio_url:
-                cache_audio_input = list(video_input if single_input_av else self._direct_input(audio_url, timeout, audio.headers))
+                cache_audio_input = list(video_input if single_input_av else self._snapshot_input(audio_url, timeout, audio.headers))
                 snapshot_jobs.append(("cache_audio", cache_audio_input, f"{audio.name} 原始"))
         snapshot_jobs.append(("video", list(video_snapshot_input), f"{video.name} 延迟后"))
         if audio_snapshot_input:
@@ -2123,6 +2251,8 @@ class LiveManager:
             if prepared.audio_copy_bsf:
                 cmd += ["-bsf:a", prepared.audio_copy_bsf]
         cmd += [
+            "-avoid_negative_ts", "make_zero",
+            "-max_muxing_queue_size", "1024",
             "-f", "hls", "-hls_time", segment, "-hls_list_size", str(playlist_size),
             "-hls_delete_threshold", "2",
             "-start_number", str(start_number),
@@ -2382,53 +2512,448 @@ class LiveManager:
             self.status["auto_align_msg"] = monitor.message
             self.status["auto_align_monitor"] = monitor.snapshot()
 
+    def auto_align_publish_status(self, monitor, msg=None):
+        self._set_align_monitor_status(monitor, msg)
+
+    def auto_align_refresh_profile(self, profile):
+        return self._refresh_runtime_auto_align_profile(profile)
+
+    def auto_align_log(self, message):
+        self.log(message)
+
+    def auto_align_read_probe_clocks(self, video_frame, audio_frame, profile):
+        video_sample = self._read_top_quarter_clock(video_frame)
+        audio_sample = self._read_top_quarter_clock(audio_frame)
+        self._save_alignment_pair_snapshots(video_frame, audio_frame, profile, video_sample, audio_sample, stage="candidate")
+        return video_sample, audio_sample
+
+    def auto_align_collect_probe_readings(self, video, audio, profile, sample_count, timeout, spacing_seconds, *, stage):
+        readings = []
+        last_error = ""
+        # Candidate sampling must read directly from the pipeline cache inputs so
+        # OCR measures the upstream delta itself. Only verify probes should
+        # re-sample with a proposed offset applied.
+        applied_offset = 0.0 if stage == "candidate" else float(profile.get("offset_seconds", 0) or 0)
+        video_offset = max(0.0, applied_offset)
+        audio_offset = max(0.0, -applied_offset)
+        with tempfile.TemporaryDirectory(prefix="align_probe_") as tmp:
+            tmpdir = Path(tmp)
+            for idx in range(max(1, int(sample_count or 1))):
+                if idx > 0:
+                    time.sleep(max(0.0, float(spacing_seconds or 0.0)))
+                try:
+                    video_cap, audio_cap = self._capture_frame_pair(
+                        video,
+                        audio,
+                        tmpdir / f"sample_{idx:02d}",
+                        timeout,
+                        video_offset=video_offset,
+                        audio_offset=audio_offset,
+                    )
+                except Exception as exc:
+                    last_error = str(exc).strip()
+                    continue
+                if (
+                    self._pair_capture_skew(video_cap, audio_cap) > ALIGN_MAX_CAPTURE_SKEW_SECONDS
+                    or self._pair_capture_finish_delta(video_cap, audio_cap) > ALIGN_MAX_FINISH_DELTA_SECONDS
+                ):
+                    last_error = "capture skew too large: video/audio frame timestamps differ too much"
+                    continue
+                with self.lock:
+                    monitor = self.status.get("auto_align_monitor")
+                    if isinstance(monitor, dict):
+                        if stage == "verify":
+                            monitor["verify_video_seconds_back"] = float(video_cap.seconds_back or 0.0)
+                            monitor["verify_audio_seconds_back"] = float(audio_cap.seconds_back or 0.0)
+                        else:
+                            monitor["candidate_video_seconds_back"] = float(video_cap.seconds_back or 0.0)
+                            monitor["candidate_audio_seconds_back"] = float(audio_cap.seconds_back or 0.0)
+                video_sample = self._read_top_quarter_clock(video_cap.path)
+                audio_sample = self._read_top_quarter_clock(audio_cap.path)
+                self._save_alignment_pair_snapshots(video_cap.path, audio_cap.path, profile, video_sample, audio_sample, stage=stage)
+                readings.append((video_sample, audio_sample))
+        if readings:
+            return readings, ""
+        return [], last_error or "probe capture failed"
+
+    def auto_align_pair_capture_skew(self, video_cap, audio_cap):
+        return self._pair_capture_skew(video_cap, audio_cap)
+
+    def auto_align_verify_candidate(self, video, audio, profile, monitor, candidate):
+        return self._verify_alignment_candidate(video, audio, profile, monitor, candidate)
+
+    def auto_align_handoff_candidate(self, video, audio, next_profile, current_pipeline, mux, run_label):
+        return self._handoff_pipeline(
+            video,
+            audio,
+            next_profile,
+            current_pipeline,
+            mux,
+            run_label,
+            source_cache=self._current_auto_align_source_cache(),
+        )
+
+    def auto_align_after_handoff(self, current_pipeline, profile):
+        self._set_current_snapshot_jobs(current_pipeline, profile)
+
+    def auto_align_persist_offset(self, offset):
+        self._save_auto_offset(offset)
+
+    def auto_align_handoff_failure(self, message):
+        with self.lock:
+            self.status["auto_align_msg"] = message
+            self.status["stage"] = "running"
+
     def _set_current_snapshot_jobs(self, pipeline, profile):
         jobs = list(pipeline.snapshot_jobs or [])
         with self.lock:
             self.current_snapshot_jobs = jobs
 
-    def _extract_current_frame(self, url, out_path, timeout, headers=None):
-        subprocess.run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-rw_timeout", str(timeout * 1_000_000),
-            *self._http_input_options(url, headers),
-            *self._local_hls_input_options(url, -1),
-            "-i", url,
-            "-frames:v", "1", "-update", "1", str(out_path),
-        ], capture_output=True, timeout=timeout + 5, check=True)
+    def _current_auto_align_source_cache(self):
+        return self._auto_align_source_cache
 
-    def _capture_frame_at_deadline(self, kind, url, out_path, timeout, headers, barrier, deadline_ns):
+    def _offset_input_args(self, input_args, offset_seconds):
+        offset = float(offset_seconds or 0.0)
+        if offset <= 0:
+            return list(input_args)
+        return ["-itsoffset", f"{offset:.3f}", *list(input_args)]
+
+    def _input_has_video_stream(self, url, timeout, headers=None):
+        text = str(url or "").strip()
+        try:
+            result = subprocess.run([
+                "ffprobe", "-hide_banner", "-loglevel", "error",
+                "-rw_timeout", str(timeout * 1_000_000),
+                *self._http_input_options(text, headers),
+                *self._local_hls_input_options(text, -1),
+                "-select_streams", "v",
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0",
+                text,
+            ], capture_output=True, text=True, timeout=timeout + 5, check=True)
+        except Exception:
+            return False
+        return bool((result.stdout or "").strip())
+
+    def _frame_capture_failure(self, url, timeout, headers, exc):
+        stderr = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            stderr = (exc.stderr or "").strip()
+        if "does not contain any stream" in stderr.lower() and not self._input_has_video_stream(url, timeout, headers):
+            source_name = Path(str(url)).name if str(url or "").endswith(".m3u8") else str(url)
+            return RuntimeError(f"frame source has no video stream: {source_name}")
+        detail = stderr.splitlines()[-1].strip() if stderr else str(exc).strip()
+        return RuntimeError(detail or "frame capture failed")
+
+    def _extract_current_frame(self, url, out_path, timeout, headers=None, offset_seconds=0.0):
+        timeout = min(coerce_int(timeout, DEFAULT_PROFILE["timeout_seconds"], minimum=5), FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
+        text = str(url or "")
+        if text.endswith(".m3u8") and not text.startswith(("http://", "https://")) and not Path(text).exists():
+            raise FileNotFoundError(f"frame source missing: {text}")
+        try:
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                *self._offset_input_args(
+                    self._fast_input_args(url, timeout, headers, live_start_index=ALIGN_FRAME_LIVE_START_INDEX),
+                    offset_seconds,
+                ),
+                "-frames:v", "1", "-update", "1", str(out_path),
+            ], capture_output=True, text=True, timeout=timeout + 5, check=True)
+        except Exception as exc:
+            raise self._frame_capture_failure(url, timeout, headers, exc) from exc
+
+    def _capture_frame_at_deadline(
+        self,
+        kind,
+        url,
+        out_path,
+        timeout,
+        headers,
+        barrier,
+        deadline_ns,
+        offset_seconds=0.0,
+        *,
+        force_live_edge=False,
+        media_time=0.0,
+        anchor_time=0.0,
+    ):
         barrier.wait()
         now_ns = time.monotonic_ns()
         if deadline_ns and now_ns < deadline_ns:
             time.sleep((deadline_ns - now_ns) / 1_000_000_000)
         started_at = time.monotonic()
-        self._extract_current_frame(url, out_path, timeout, headers)
+        if force_live_edge or float(offset_seconds or 0.0) > 0:
+            self._extract_frame_from_live_edge(url, offset_seconds, out_path, timeout, headers)
+        else:
+            self._extract_current_frame(url, out_path, timeout, headers, offset_seconds=0.0)
         finished_at = time.monotonic()
-        return FrameCaptureResult(Path(out_path), kind, started_at, finished_at, source=kind)
+        return FrameCaptureResult(
+            Path(out_path),
+            kind,
+            started_at,
+            finished_at,
+            media_time=float(media_time or 0.0),
+            source=kind,
+            anchor_time=float(anchor_time or 0.0),
+            seconds_back=float(offset_seconds or 0.0),
+        )
 
-    def _capture_frame_pair(self, video, audio, tmpdir, timeout, *, deadline_delay=1.25):
+    def _capture_frame_pair(self, video, audio, tmpdir, timeout, *, deadline_delay=1.25, video_offset=0.0, audio_offset=0.0):
+        tmpdir = Path(tmpdir)
+        tmpdir.mkdir(parents=True, exist_ok=True)
         video_frame = tmpdir / "align_video.jpg"
         audio_frame = tmpdir / "align_audio.jpg"
         barrier = threading.Barrier(2)
         deadline_ns = time.monotonic_ns() + int(max(0.0, deadline_delay) * 1_000_000_000)
+        capture_plan = self._shared_local_hls_capture_plan(
+            video.url,
+            audio.url,
+            video_offset=video_offset,
+            audio_offset=audio_offset,
+        )
+        force_live_edge = bool(capture_plan)
+        shared_anchor_time = capture_plan["anchor_time"] if capture_plan else 0.0
+        video_capture_offset = capture_plan["video_seconds_back"] if capture_plan else video_offset
+        audio_capture_offset = capture_plan["audio_seconds_back"] if capture_plan else audio_offset
+        video_media_time = capture_plan["video_target"] if capture_plan else 0.0
+        audio_media_time = capture_plan["audio_target"] if capture_plan else 0.0
         with ThreadPoolExecutor(max_workers=2) as pool:
             futs = [
-                pool.submit(self._capture_frame_at_deadline, "video", video.url, video_frame, timeout, video.headers, barrier, deadline_ns),
-                pool.submit(self._capture_frame_at_deadline, "audio", audio.url, audio_frame, timeout, audio.headers, barrier, deadline_ns),
+                pool.submit(
+                    self._capture_frame_at_deadline,
+                    "video",
+                    video.url,
+                    video_frame,
+                    timeout,
+                    video.headers,
+                    barrier,
+                    deadline_ns,
+                    video_capture_offset,
+                    force_live_edge=force_live_edge,
+                    media_time=video_media_time,
+                    anchor_time=shared_anchor_time,
+                ),
+                pool.submit(
+                    self._capture_frame_at_deadline,
+                    "audio",
+                    audio.url,
+                    audio_frame,
+                    timeout,
+                    audio.headers,
+                    barrier,
+                    deadline_ns,
+                    audio_capture_offset,
+                    force_live_edge=force_live_edge,
+                    media_time=audio_media_time,
+                    anchor_time=shared_anchor_time,
+                ),
             ]
             results = []
             for fut in as_completed(futs):
                 results.append(fut.result())
-        results.sort(key=lambda item: item.kind)
-        return results[0], results[1]
+        by_kind = {item.kind: item for item in results}
+        return by_kind["video"], by_kind["audio"]
 
     def _capture_alignment_frames(self, video, audio, tmpdir, timeout):
         video_cap, audio_cap = self._capture_frame_pair(video, audio, tmpdir, timeout)
         return video_cap.path, audio_cap.path
 
+    def _pair_capture_uses_shared_anchor(self, left, right):
+        return float(getattr(left, "anchor_time", 0.0) or 0.0) > 0 and float(getattr(right, "anchor_time", 0.0) or 0.0) > 0
+
     def _pair_capture_skew(self, left, right):
+        if self._pair_capture_uses_shared_anchor(left, right):
+            return abs(float(left.anchor_time) - float(right.anchor_time))
         return abs(left.started_at - right.started_at)
+
+    def _pair_capture_finish_delta(self, left, right):
+        if self._pair_capture_uses_shared_anchor(left, right):
+            return 0.0
+        return abs(left.finished_at - right.finished_at)
+
+    def _playlist_window_duration(self, playlist_path):
+        playlist = Path(playlist_path or "")
+        try:
+            lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            return 0.0
+        duration = 0.0
+        for raw in lines:
+            match = HLS_EXTINF_RE.match(raw.strip())
+            if not match:
+                continue
+            try:
+                duration += float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+        return duration
+
+    def _playlist_segment_durations(self, playlist_path):
+        playlist = Path(playlist_path or "")
+        try:
+            lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            return []
+        durations = []
+        pending = None
+        for raw in lines:
+            line = raw.strip()
+            match = HLS_EXTINF_RE.match(line)
+            if match:
+                try:
+                    pending = float(match.group(1))
+                except (TypeError, ValueError):
+                    pending = None
+                continue
+            if not line or line.startswith("#"):
+                continue
+            if pending is None:
+                continue
+            durations.append(pending)
+            pending = None
+        return durations
+
+    def _parse_program_date_time(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _playlist_program_time_window(self, playlist_path):
+        playlist = Path(playlist_path or "")
+        try:
+            lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            return None
+        cursor_ts = None
+        pending_duration = None
+        pending_pdt = None
+        start_time = None
+        end_time = None
+        segment_count = 0
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                pending_pdt = self._parse_program_date_time(line.split(":", 1)[1])
+                continue
+            match = HLS_EXTINF_RE.match(line)
+            if match:
+                try:
+                    pending_duration = float(match.group(1))
+                except (TypeError, ValueError):
+                    pending_duration = None
+                continue
+            if line.startswith("#"):
+                continue
+            if pending_pdt is not None:
+                cursor_ts = pending_pdt
+            if pending_duration is None or cursor_ts is None:
+                pending_duration = None
+                pending_pdt = None
+                continue
+            segment_start = cursor_ts
+            segment_end = cursor_ts + pending_duration
+            if start_time is None:
+                start_time = segment_start
+            end_time = segment_end
+            segment_count += 1
+            cursor_ts = segment_end
+            pending_duration = None
+            pending_pdt = None
+        if segment_count <= 0 or start_time is None or end_time is None:
+            return None
+        return PlaylistProgramWindow(start_time, end_time, segment_count)
+
+    def _shared_local_hls_capture_plan(self, video_url, audio_url, *, video_offset=0.0, audio_offset=0.0):
+        video_text = str(video_url or "").strip()
+        audio_text = str(audio_url or "").strip()
+        if not video_text or not audio_text:
+            return None
+        if video_text.startswith(("http://", "https://")) or audio_text.startswith(("http://", "https://")):
+            return None
+        if not video_text.endswith(".m3u8") or not audio_text.endswith(".m3u8"):
+            return None
+        video_window = self._playlist_program_time_window(video_text)
+        audio_window = self._playlist_program_time_window(audio_text)
+        if not video_window or not audio_window:
+            return None
+
+        anchor_time = min(video_window.end_time, audio_window.end_time) - ALIGN_CAPTURE_ANCHOR_MARGIN_SECONDS
+        video_target = anchor_time - max(0.0, float(video_offset or 0.0))
+        audio_target = anchor_time - max(0.0, float(audio_offset or 0.0))
+        if video_target <= video_window.start_time or audio_target <= audio_window.start_time:
+            return None
+
+        video_seconds_back = video_window.end_time - video_target
+        audio_seconds_back = audio_window.end_time - audio_target
+        if video_seconds_back <= 0 or audio_seconds_back <= 0:
+            return None
+
+        return {
+            "anchor_time": anchor_time,
+            "video_target": video_target,
+            "audio_target": audio_target,
+            "video_seconds_back": video_seconds_back,
+            "audio_seconds_back": audio_seconds_back,
+        }
+
+    def _local_hls_seek_plan(self, playlist_path, seconds_back):
+        durations = self._playlist_segment_durations(playlist_path)
+        if not durations:
+            raise RuntimeError(f"playlist has no duration: {Path(playlist_path).name}")
+        total_duration = sum(durations)
+        target_time = max(0.0, total_duration - max(0.0, float(seconds_back or 0.0)))
+        if target_time <= 0:
+            return 0, 0.0
+
+        starts = []
+        elapsed = 0.0
+        for duration in durations:
+            starts.append(elapsed)
+            elapsed += duration
+
+        start_index = max(0, len(durations) - 1)
+        for idx, segment_start in enumerate(starts):
+            if target_time < segment_start + durations[idx]:
+                start_index = idx
+                break
+
+        # Keep ffmpeg's post-input seek short; larger seeks on the rolling 4K
+        # local cache reproduce the 20s verify timeout seen in production.
+        max_local_seek = 6.0
+        while start_index > 0 and (target_time - starts[start_index - 1]) <= max_local_seek:
+            start_index -= 1
+
+        live_start_index = 0 if start_index <= 0 else start_index - len(durations)
+        seek_seconds = max(0.0, target_time - starts[start_index])
+        return live_start_index, seek_seconds
+
+    def _extract_frame_from_live_edge(self, url, seconds_back, out_path, timeout, headers=None):
+        timeout = min(coerce_int(timeout, DEFAULT_PROFILE["timeout_seconds"], minimum=5), FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
+        seconds_back = max(0.0, float(seconds_back or 0.0))
+        text = str(url or "").strip()
+        is_http = text.startswith(("http://", "https://"))
+        if not is_http and text.endswith(".m3u8"):
+            playlist = Path(text)
+            if not playlist.exists():
+                raise FileNotFoundError(f"frame source missing: {text}")
+            live_start_index, at = self._local_hls_seek_plan(playlist, seconds_back)
+            try:
+                subprocess.run([
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    *self._fast_input_args(text, timeout, headers, live_start_index=live_start_index),
+                    "-ss", f"{at:.3f}",
+                    "-frames:v", "1", "-update", "1", str(out_path),
+                ], capture_output=True, text=True, timeout=timeout + 10, check=True)
+            except Exception as exc:
+                raise self._frame_capture_failure(text, timeout, headers, exc) from exc
+            return
+        self._extract_current_frame(url, out_path, timeout, headers, offset_seconds=seconds_back)
 
     def _read_locked_clock(self, frame_path, roi, kind=None):
         if roi is None:
@@ -2436,232 +2961,57 @@ class LiveManager:
         parsed = self._ocr_time(frame_path, roi)
         if not parsed:
             if kind:
+                self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
                 with self.lock:
-                    self.status.setdefault("last_ocr_results", {})[kind] = {"clock": None, "error": "OCR failed"}
+                    self.status.setdefault("last_ocr_results", {})[kind] = {
+                        "clock": None,
+                        "error": "OCR failed",
+                        "provider": "",
+                        "note": "",
+                    }
             return None
-        result = ClockSample(0.0, parsed[0], parsed[1], roi)
+        result = ClockSample(0.0, parsed[0], parsed[1], roi, parsed[2] if len(parsed) > 2 else "", parsed[3] if len(parsed) > 3 else "")
         if kind:
+            self._set_ocr_diagnostic(kind, provider=result.provider, note=result.note)
             with self.lock:
                 self.status.setdefault("last_ocr_results", {})[kind] = {
                     "clock": result.text,
                     "game_time": result.game_time,
                     "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                    "provider": result.provider,
+                    "note": result.note,
                 }
         return result
 
     def _read_top_quarter_clock(self, frame_path, kind=None):
         return self._read_locked_clock(frame_path, self._scoreboard_top_quarter_roi(), kind=kind)
 
-    def _roi_store(self):
-        data = self.roi if isinstance(self.roi, dict) else {}
-        if "channels" not in data or not isinstance(data.get("channels"), dict):
-            data = {
-                "version": 2,
-                "channels": {},
-                "legacy": data,
-            }
-            self.roi = data
-        data.setdefault("version", 2)
-        data.setdefault("channels", {})
-        return data
-
-    def _save_roi_store(self):
-        with self.lock:
-            data = self._roi_store()
-            snapshot = json.loads(json.dumps(data))
-        json_save(ROI_PATH, snapshot)
-
-    def _channel_roi_key(self, kind, channel):
-        channel = channel or Channel(name=kind, url="")
-        basis = "|".join([
-            kind,
-            channel.tvg_id or "",
-            channel.tvg_name or "",
-            channel.name or "",
-            channel.group or "",
-        ]).strip("|")
-        readable = normalize_key_text(channel.tvg_id or channel.tvg_name or channel.name or kind) or kind
-        digest_basis = basis or f"{kind}|{channel.url or ''}"
-        digest = hashlib.sha1(digest_basis.encode("utf-8", errors="ignore")).hexdigest()[:12]
-        return f"{kind}:{readable}:{digest}"
-
-    def _channel_roi_entry(self, kind, channel):
-        key = self._channel_roi_key(kind, channel)
-        with self.lock:
-            entry = dict(self._roi_store().get("channels", {}).get(key) or {})
-        roi = entry.get("roi")
-        try:
-            parsed_roi = parse_roi(",".join(str(part) for part in roi)) if isinstance(roi, (list, tuple)) else parse_roi(roi)
-        except (TypeError, ValueError):
-            return key, None
-        entry["roi"] = parsed_roi
-        return key, entry
-
-    def _timer_preview_roi(self, roi):
-        x, y, w, h = roi
-        cx = x + w / 2
-        cy = y + h / 2
-        pw = min(1.0, w * TIMER_ROI_PREVIEW_MULTIPLIER)
-        ph = min(1.0, h * TIMER_ROI_PREVIEW_MULTIPLIER)
-        px = min(max(0.0, cx - pw / 2), max(0.0, 1.0 - pw))
-        py = min(max(0.0, cy - ph / 2), max(0.0, 1.0 - ph))
-        return px, py, pw, ph
-
-    def _scoreboard_top_half_roi(self):
-        return (0.0, 0.0, 1.0, 0.5)
-
     def _scoreboard_top_quarter_roi(self):
         return (0.0, 0.0, 1.0, 0.25)
-
-    def _scoreboard_top_quadrant_roi(self, side):
-        side = str(side or "").strip().lower()
-        if side in ("right", "2"):
-            return (0.5, 0.0, 0.5, 0.5)
-        if side in ("left", "1"):
-            return (0.0, 0.0, 0.5, 0.5)
-        return None
-
-    def _is_scoreboard_top_scan_roi(self, roi):
-        if not roi:
-            return False
-        return tuple(round(float(part), 3) for part in roi) in (
-            (0.0, 0.0, 1.0, 0.5),
-            (0.0, 0.0, 0.5, 0.5),
-            (0.5, 0.0, 0.5, 0.5),
-        )
-
-    def _scoreboard_scan_roi(self, side="left", width=0.5, height=0.5):
-        width = min(max(width, 0.5), 1.0)
-        height = min(max(height, 0.25), 1.0)
-        if side == "right":
-            x = 1.0 - width
-        elif side == "center":
-            x = max(0.0, (1.0 - width) / 2)
-        else:
-            x = 0.0
-        return x, 0.0, width, height
-
-    def _save_timer_roi_preview(self, frame_path, kind, key, roi):
-        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        ROI_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-        crop = self._roi_crop(frame_path, self._timer_preview_roi(roi))
-        if crop is None:
-            return ""
-        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)[:96]
-        out = ROI_PREVIEW_DIR / f"{safe_key}.jpg"
-        tmp = ROI_PREVIEW_DIR / f".{safe_key}.tmp.jpg"
-        cv2.imwrite(str(tmp), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        os.replace(tmp, out)
-        return out.name
-
-    def _save_channel_roi(self, kind, channel, sample, source, frame_path=None, key=None):
-        if not sample or not sample.roi:
-            return None
-        if key is None:
-            key = self._channel_roi_key(kind, channel)
-        preview = ""
-        if frame_path is not None:
-            preview = self._save_timer_roi_preview(frame_path, kind, key, sample.roi)
-        entry = {
-            "key": key,
-            "kind": kind,
-            "channel": channel.name if channel else kind,
-            "tvg_id": channel.tvg_id if channel else "",
-            "tvg_name": channel.tvg_name if channel else "",
-            "group": channel.group if channel else "",
-            "roi": [round(float(part), 6) for part in sample.roi],
-            "source": source,
-            "clock": sample.text,
-            "preview": preview,
-            "updated_at": now(),
-            "updated_at_unix": int(time.time()),
-        }
-        with self.lock:
-            store = self._roi_store()
-            old = store["channels"].get(key) or {}
-            if not preview and old.get("preview"):
-                entry["preview"] = old.get("preview", "")
-            store["channels"][key] = entry
-            snapshot = json.loads(json.dumps(store))
-        json_save(ROI_PATH, snapshot)
-        return entry
-
-    def _timer_roi_entries(self):
-        with self.lock:
-            channels = dict(self._roi_store().get("channels", {}))
-        entries = []
-        for key, raw in channels.items():
-            if not isinstance(raw, dict):
-                continue
-            entry = dict(raw)
-            entry["key"] = key
-            preview = str(entry.get("preview") or "")
-            if preview:
-                path = ROI_PREVIEW_DIR / preview
-                entry["preview_url"] = f"/roi-previews/{preview}" if path.exists() else ""
-                try:
-                    entry["preview_mtime"] = path.stat().st_mtime if path.exists() else 0
-                except FileNotFoundError:
-                    entry["preview_mtime"] = 0
-            else:
-                entry["preview_url"] = ""
-                entry["preview_mtime"] = 0
-            entries.append(entry)
-        entries.sort(key=lambda item: (item.get("kind") != "video", item.get("channel", ""), item.get("key", "")))
-        return entries
-
-    def delete_timer_roi(self, key, *, roi=True, preview=True):
-        key = str(key or "").strip()
-        if not key:
-            raise RuntimeError("missing ROI key")
-        removed = {}
-        with self.lock:
-            store = self._roi_store()
-            entry = store["channels"].get(key)
-            if not entry:
-                return {"ok": True, "key": key, "removed": False}
-            removed = dict(entry)
-            if preview and entry.get("preview"):
-                removed["preview"] = entry.get("preview")
-                entry["preview"] = ""
-            if roi:
-                removed = dict(store["channels"].pop(key))
-            snapshot = json.loads(json.dumps(store))
-        if preview and removed.get("preview"):
-            (ROI_PREVIEW_DIR / removed["preview"]).unlink(missing_ok=True)
-        json_save(ROI_PATH, snapshot)
-        self.log(f"timer ROI {'deleted' if roi else 'preview deleted'}: {key}")
-        return {"ok": True, "key": key, "removed": True}
-
-    def _preset_rois_for_kind(self, profile, kind):
-        key = "audio_roi_presets" if kind == "audio" else "video_roi_presets"
-        rois = parse_roi_list(profile.get(key, ""))
-        bad_lines = len(split_lines(profile.get(key, ""))) - len(rois)
-        if bad_lines > 0:
-            self.log(f"auto-align: ignored {bad_lines} invalid {kind} ROI preset(s)")
-        return rois
-
-    def _read_preset_clock(self, frame_path, profile, kind):
-        for roi in self._preset_rois_for_kind(profile, kind):
-            sample = self._read_locked_clock(frame_path, roi)
-            if sample:
-                return sample
-        return None
 
     def _find_frame_clock(self, frame_path, *, full_frame=False, profile=None):
         if profile is None:
             profile = self.get_profile()
         providers = ocr_provider_order(profile)
-        if not providers:
+        if not providers and not rapidocr_available():
             return None
+        any_request_failure = False
         for idx, provider in enumerate(providers):
-            if idx > 0 and not ocr_provider_ready_for(provider, profile):
-                continue
             if idx > 0 and full_frame:
                 self.log(f"OCR primary '{providers[0]}' failed, fallback to '{provider}'")
-            found = coerce_clock_sample(self._try_ocr_provider(provider, frame_path, profile))
+            provider_result = self._try_ocr_provider(provider, frame_path, profile)
+            if provider_result.request_failed:
+                any_request_failure = True
+            found = coerce_clock_sample(provider_result.value)
             if found:
                 return found
+        if providers and not any_request_failure:
+            return None
+        found = coerce_clock_sample(self._rapidocr_time(frame_path))
+        if found:
+            if providers and full_frame:
+                self.log("OCR remote providers failed, fallback to 'rapidocr_local'")
+            return found
         return None
 
     def _try_ocr_provider(self, provider, frame_path, profile):
@@ -2669,276 +3019,74 @@ class LiveManager:
             return self._find_clock_via_ocrspace(frame_path, profile)
         elif provider == "custom":
             return self._find_clock_via_custom(frame_path, profile)
-        return None
-
-    def _find_clock_with_presets(self, frame_path, profile, kind):
-        sample = self._read_preset_clock(frame_path, profile, kind)
-        if sample:
-            return sample, "preset"
-        sample = self._find_frame_clock(frame_path, profile=profile)
-        if sample:
-            return sample, "auto"
-        return None, ""
-
-    def _resolve_monitor_roi_for_frame(self, frame_path, kind, profile, monitor, channel_name):
-        ch_key = monitor.video_channel_key if kind == "video" else monitor.audio_channel_key
-        # 1. Channel cache ROI
-        if ch_key:
-            with self.lock:
-                entry = dict(self._roi_store().get("channels", {}).get(ch_key) or {})
-            if entry and entry.get("roi"):
-                try:
-                    raw = entry["roi"]
-                    if isinstance(raw, (list, tuple)):
-                        roi = parse_roi(",".join(str(p) for p in raw))
-                    else:
-                        roi = parse_roi(str(raw))
-                    if self._clock_candidate_roi_plausible(roi):
-                        sample = self._read_locked_clock(frame_path, roi)
-                        if sample:
-                            return sample, "cache"
-                except (TypeError, ValueError):
-                    pass
-        # 2. Preset ROIs (first-run fallback)
-        sample = self._read_preset_clock(frame_path, profile, kind)
-        if sample:
-            chan = Channel(name=channel_name, url="")
-            self._save_channel_roi(kind, chan, sample, "preset", frame_path=frame_path, key=ch_key)
-            return sample, "preset"
-        # 3. Profile manual ROI (legacy override)
-        roi_key = "audio_roi" if kind == "audio" else "video_roi"
-        try:
-            manual_roi = parse_roi(profile.get(roi_key, DEFAULT_PROFILE[roi_key]))
-            if self._clock_candidate_roi_plausible(manual_roi):
-                sample = self._read_locked_clock(frame_path, manual_roi)
-                if sample:
-                    chan = Channel(name=channel_name, url="")
-                    self._save_channel_roi(kind, chan, sample, "manual", frame_path=frame_path, key=ch_key)
-                    return sample, "manual"
-        except (TypeError, ValueError):
-            pass
-        now = time.time()
-        probe_at = monitor.video_next_probe_at if kind == "video" else monitor.audio_next_probe_at
-        search_started = monitor.video_search_started_at if kind == "video" else monitor.audio_search_started_at
-        if probe_at > 0 and now < probe_at:
-            return None, ""
-        if search_started > 0 and now - search_started > TIMER_ROI_SCAN_WINDOW_SECONDS:
-            return None, ""
-        if search_started <= 0:
-            if kind == "video":
-                monitor.video_search_started_at = now
-            else:
-                monitor.audio_search_started_at = now
-        sample = self._find_frame_clock(frame_path, full_frame=True)
-        if kind == "video":
-            monitor.video_next_probe_at = now + TIMER_ROI_SCAN_INTERVAL_SECONDS
-        else:
-            monitor.audio_next_probe_at = now + TIMER_ROI_SCAN_INTERVAL_SECONDS
-        if sample:
-            chan = Channel(name=channel_name, url="")
-            self._save_channel_roi(kind, chan, sample, "scan", frame_path=frame_path, key=ch_key)
-            return sample, "scan"
-        return None, ""
-
-    def _lock_monitor_roi(self, monitor, kind, sample, profile, source):
-        if kind == "audio":
-            monitor.audio_roi = sample.roi
-            monitor.audio_roi_locked = True
-            monitor.audio_clock = sample.text
-        else:
-            monitor.video_roi = sample.roi
-            monitor.video_roi_locked = True
-            monitor.video_clock = sample.text
-        self._save_monitor_rois(profile, monitor)
-        self.log(f"auto-align: locked {kind} ROI from {source} {self._format_roi_value(sample.roi)} ({sample.text})")
-
-    def _candidate_offset_from_samples(self, video_sample, audio_sample, profile):
-        offset = -(audio_sample.game_time - video_sample.game_time)
-        max_offset = coerce_float(profile.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"], minimum=1)
-        if abs(offset) > max_offset:
-            return None, f"offset {offset:.3f}s exceeds +/-{max_offset}s"
-        return offset, f"v={video_sample.text} a={audio_sample.text}"
-
-    def _sample_pair_offset(self, video_sample, audio_sample, profile):
-        offset = -(audio_sample.game_time - video_sample.game_time)
-        max_offset = coerce_float(profile.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"], minimum=1)
-        if abs(offset) > max_offset:
-            return None
-        return offset
-
-    def _offset_cluster_center(self, offsets):
-        if not offsets:
-            return None
-        ordered = sorted(offsets)
-        median = ordered[len(ordered) // 2]
-        deviations = [abs(item - median) for item in ordered]
-        mad = sorted(deviations)[len(deviations) // 2]
-        limit = max(1.5, mad * 3.0)
-        cluster = [item for item in ordered if abs(item - median) <= limit]
-        if len(cluster) < 3:
-            return None
-        cluster.sort()
-        return cluster[len(cluster) // 2]
-
-    def _stable_mismatch_offset(self, offsets):
-        if not offsets:
-            return None
-        return self._offset_cluster_center(offsets)
-
-    def _monitor_alignment_from_frames(self, video_frame, audio_frame, profile, monitor):
-        threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
-        current = float(profile.get("offset_seconds", 0) or 0)
-        monitor.checks += 1
-        video_sample = self._read_top_quarter_clock(video_frame, kind="video")
-        audio_sample = self._read_top_quarter_clock(audio_frame, kind="audio")
-
-        if not video_sample or not audio_sample:
-            if not video_sample:
-                monitor.video_missing_count += 1
-            else:
-                monitor.video_missing_count = 0
-            if not audio_sample:
-                monitor.audio_missing_count += 1
-            else:
-                monitor.audio_missing_count = 0
-            total_missing = max(monitor.video_missing_count, monitor.audio_missing_count)
-            monitor.state = "acquiring"
-            missing = []
-            if not video_sample:
-                missing.append("video")
-            if not audio_sample:
-                missing.append("audio")
-            monitor.message = f"timer missing ({total_missing}/3): {', '.join(missing)}"
-            return None, monitor.message
-
-        monitor.video_missing_count = 0
-        monitor.audio_missing_count = 0
-        monitor.video_clock = video_sample.text
-        monitor.audio_clock = audio_sample.text
-
-        candidate = self._sample_pair_offset(video_sample, audio_sample, profile)
-        if candidate is None:
-            monitor.state = "acquiring"
-            monitor.message = "offset exceeds max bound"
-            return None, monitor.message
-
-        delta = abs(candidate - current)
-        if video_sample.game_time == audio_sample.game_time and delta >= threshold:
-            monitor.state = "realigning"
-            monitor.message = f"matched clocks; new offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
-            self.log(f"auto-align: {monitor.message}")
-            return candidate, monitor.message
-
-        if (
-            monitor.checks <= 2
-            and delta >= max(threshold * 3, 3.0)
-            and abs(video_sample.game_time - audio_sample.game_time) >= max(threshold * 3, 3.0)
-        ):
-            monitor.state = "realigning"
-            monitor.message = f"early mismatch; new offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
-            self.log(f"auto-align: {monitor.message}")
-            return candidate, monitor.message
-
-        if delta < threshold:
-            monitor.state = "aligned"
-            monitor.message = f"stable current={current:.3f}s candidate={candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
-            monitor.mismatch_offsets.clear()
-            monitor.mismatch_count = 0
-            return None, monitor.message
-
-        monitor.mismatch_offsets = [candidate]
-        monitor.mismatch_count = 1
-        monitor.state = "realigning"
-        monitor.message = f"mismatch; new offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
-        self.log(f"auto-align: {monitor.message}")
-        return candidate, monitor.message
-
-    def _monitor_alignment_once(self, video, audio, profile, monitor):
-        if not audio or not audio.url:
-            monitor.state = "disabled"
-            monitor.message = "video-only; no audio clock to compare"
-            return None, monitor.message
-
-        timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-        with tempfile.TemporaryDirectory(prefix="align_frame_") as tmp:
-            tmpdir = Path(tmp)
-            try:
-                video_cap, audio_cap = self._capture_frame_pair(video, audio, tmpdir, timeout)
-            except Exception as exc:
-                monitor.state = "capture_failed"
-                monitor.message = f"frame capture failed: {exc}"
-                self.log(f"auto-align: {monitor.message}; keeping current offset")
-                return None, monitor.message
-            if self._pair_capture_skew(video_cap, audio_cap) > 0.75 or abs(video_cap.finished_at - audio_cap.finished_at) > 1.0:
-                monitor.state = "capture_failed"
-                monitor.message = "paired capture skew too large; retrying"
-                return None, monitor.message
-            return self._monitor_alignment_from_frames(video_cap.path, audio_cap.path, profile, monitor)
+        return OcrProviderResult()
 
     def _read_verify_clock(self, frame_path, kind, profile, monitor):
         return self._read_top_quarter_clock(frame_path)
 
     def _verify_alignment_candidate(self, video, audio, profile, monitor, candidate):
         if not audio or not audio.url:
+            monitor.verify_video_clock = ""
+            monitor.verify_audio_clock = ""
+            monitor.verify_delta = None
+            monitor.verify_message = "video-only; no audio clock to compare"
             return False, "video-only; no audio clock to compare"
         threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"], minimum=0.1)
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-        segment_seconds = effective_segment_time(profile)
-        verify_video = video
-        verify_audio = audio
-        verify_proc = None
-        verify_dir = None
         previous_stage = ""
         with self.lock:
             previous_stage = self.status.get("stage", "")
         try:
-            if candidate >= 0.5:
-                verify_dir = Path(tempfile.mkdtemp(prefix="align_verify_"))
-                verify_playlist = verify_dir / "video_delay.m3u8"
-                list_size = max(20, int(candidate / segment_seconds) + 20)
-                video_codec = self._probe_video_codec(video, timeout)
-                verify_proc = self._start_delay_recorder(video, verify_playlist, f"{segment_seconds:.3f}", list_size, timeout, "video", video_codec)
-                try:
-                    self._buffer_delay_input(verify_proc, verify_playlist, candidate, timeout, "verifying video")
-                finally:
-                    with self.lock:
-                        if self.status.get("stage", "").startswith("verifying "):
-                            self.status["stage"] = previous_stage or "running"
-                verify_video = Channel(name=video.name, url=str(verify_playlist))
-            elif candidate <= -0.5:
-                verify_dir = Path(tempfile.mkdtemp(prefix="align_verify_"))
-                verify_playlist = verify_dir / "audio_delay.m3u8"
-                list_size = max(20, int(abs(candidate) / segment_seconds) + 20)
-                audio_stream_index, _audio_codec = self._select_audio_stream(audio, timeout)
-                verify_proc = self._start_delay_recorder(audio, verify_playlist, f"{segment_seconds:.3f}", list_size, timeout, "audio", audio_stream_index=audio_stream_index)
-                try:
-                    self._buffer_delay_input(verify_proc, verify_playlist, candidate, timeout, "verifying audio")
-                finally:
-                    with self.lock:
-                        if self.status.get("stage", "").startswith("verifying "):
-                            self.status["stage"] = previous_stage or "running"
-                verify_audio = Channel(name=audio.name, url=str(verify_playlist))
-
-            with tempfile.TemporaryDirectory(prefix="align_verify_frame_") as tmp:
-                tmpdir = Path(tmp)
-                try:
-                    video_cap, audio_cap = self._capture_frame_pair(verify_video, verify_audio, tmpdir, timeout)
-                except Exception as exc:
-                    return False, f"verify capture failed: {exc}"
-                if self._pair_capture_skew(video_cap, audio_cap) > 0.75 or abs(video_cap.finished_at - audio_cap.finished_at) > 1.0:
-                    return False, "verify capture skew too large"
-                video_sample = self._read_verify_clock(video_cap.path, "video", profile, monitor)
-                audio_sample = self._read_verify_clock(audio_cap.path, "audio", profile, monitor)
-                if not video_sample or not audio_sample:
-                    return False, "verify OCR failed"
-                delta = abs(video_sample.game_time - audio_sample.game_time)
-                if delta <= threshold:
-                    return True, f"verified offset {candidate:.3f}s v={video_sample.text} a={audio_sample.text}"
-                return False, f"verify mismatch {delta:.1f}s v={video_sample.text} a={audio_sample.text}"
+            readings, error = self.auto_align_collect_probe_readings(
+                video,
+                audio,
+                {**profile, "offset_seconds": candidate},
+                1,
+                timeout,
+                0.0,
+                stage="verify",
+            )
+            if error and not readings:
+                monitor.verify_video_clock = ""
+                monitor.verify_audio_clock = ""
+                monitor.verify_delta = None
+                monitor.verify_message = f"verify capture failed: {error}"
+                return False, f"verify capture failed: {error}"
+            if not readings:
+                monitor.verify_video_clock = ""
+                monitor.verify_audio_clock = ""
+                monitor.verify_delta = None
+                monitor.verify_message = "verify OCR unstable"
+                return False, "verify OCR unstable"
+            video_sample, audio_sample = readings[0]
+            if not video_sample or not audio_sample:
+                monitor.verify_video_clock = video_sample.text if video_sample else ""
+                monitor.verify_audio_clock = audio_sample.text if audio_sample else ""
+                monitor.verify_delta = None
+                monitor.verify_message = "verify OCR unstable"
+                return False, "verify OCR unstable"
+            delta = abs(video_sample.game_time - audio_sample.game_time)
+            monitor.verify_video_clock = video_sample.text
+            monitor.verify_audio_clock = audio_sample.text
+            monitor.verify_delta = delta
+            if delta <= threshold:
+                monitor.verify_message = (
+                    f"verified offset {candidate:.3f}s delta={delta:.1f}s "
+                    f"v={video_sample.text} a={audio_sample.text}"
+                )
+                return True, (
+                    f"verified offset {candidate:.3f}s delta={delta:.1f}s "
+                    f"v={video_sample.text} a={audio_sample.text}"
+                )
+            monitor.verify_message = (
+                f"verify mismatch delta={delta:.1f}s "
+                f"v={video_sample.text} a={audio_sample.text}"
+            )
+            return False, (
+                f"verify mismatch delta={delta:.1f}s "
+                f"v={video_sample.text} a={audio_sample.text}"
+            )
         finally:
-            self._stop_processes([verify_proc] if verify_proc else [])
-            if verify_dir:
-                shutil.rmtree(verify_dir, ignore_errors=True)
             with self.lock:
                 if self.status.get("stage", "").startswith("verifying "):
                     self.status["stage"] = previous_stage or "running"
@@ -2985,6 +3133,7 @@ class LiveManager:
             current_pipeline = self._prepare_pipeline(pipeline_video, pipeline_audio, profile, f"run_{run_id:03d}", source_cache=source_cache)
         except Exception as exc:
             return str(exc)
+        self._auto_align_source_cache = source_cache
         self._set_current_snapshot_jobs(current_pipeline, profile)
         playlist_path = HLS_DIR / "index.m3u8"
         start_number = self._next_hls_start_number() if preserve_hls else 0
@@ -3011,22 +3160,22 @@ class LiveManager:
                 return self._classify_stall_failure(source_cache, f"warmup failed: {exc}")
 
         first_segment_deadline = time.time() + startup_timeout
-        last_snapshot_check = 0.0
         last_runtime_prune_check = 0.0
-        auto_align_profile = profile.copy()
-        align_monitor = AlignmentMonitor()
-        align_monitor.video_channel = video.name if video else ""
-        align_monitor.audio_channel = audio.name if audio and audio.url else ""
-        align_monitor.video_channel_key = self._channel_roi_key("video", video)
-        align_monitor.audio_channel_key = self._channel_roi_key("audio", audio) if audio and audio.url else ""
-        align_monitor.state = "acquiring"
-        align_monitor.message = "reading timer from top quarter"
-        with self.lock:
-            self.status["auto_align_state"] = align_monitor.state
-            self.status["auto_align_msg"] = align_monitor.message
-            self.status["auto_align_monitor"] = align_monitor.snapshot()
+        auto_align = AutoAlignController(
+            self,
+            video,
+            audio,
+            profile,
+            pipeline_video,
+            pipeline_audio,
+            current_pipeline,
+            mux,
+            HandoffDeferred,
+        )
+        auto_align.run_id = run_id
+        auto_align.first_segment_deadline = first_segment_deadline
         while not self.stop_event.is_set():
-            auto_align_profile = self._refresh_runtime_auto_align_profile(auto_align_profile)
+            auto_align_profile = auto_align.refresh_profile()
             cache_failure = self._source_cache_failure(source_cache)
             if cache_failure:
                 return cache_failure
@@ -3060,80 +3209,27 @@ class LiveManager:
                     f"{self._mux_failure_detail(mux, current_pipeline)}"
                 )
                 return self._source_cache_stall_failure(source_cache, stall_timeout) or self._classify_stall_failure(source_cache, detail)
-            cycle_interval = coerce_float(auto_align_profile.get("auto_align_interval"), DEFAULT_PROFILE["auto_align_interval"], minimum=5)
             align_allowed_now = self._auto_align_allowed_by_schedule(auto_align_profile)
-            if not align_allowed_now and align_monitor.state != "disabled":
-                align_monitor.state = "disabled"
-                self._set_align_monitor_status(align_monitor, "非比赛时间：直播继续，暂停自动截图和对齐")
-            current_provider = normalize_ocr_provider(auto_align_profile.get("ocr_provider"))
-            current_key_name = "ocr_api_key" if current_provider == "custom" else "ocrspace_api_key"
-            api_key = coerce_text(auto_align_profile.get(current_key_name, "")).strip()
-            if not api_key:
-                align_monitor.state = "disabled"
-                self._set_align_monitor_status(align_monitor, "OCR 未配置 API Key，暂停自动对齐")
-            # Adaptive frequency: high before alignment, low after
-            if align_monitor.state == "aligned":
-                probe_interval = max(cycle_interval * 5, 300)
-            elif align_monitor.locked():
-                probe_interval = max(cycle_interval, TIMER_ROI_SCAN_INTERVAL_SECONDS)
-            else:
-                probe_interval = max(cycle_interval, TIMER_ROI_SCAN_INTERVAL_SECONDS)
-            if align_allowed_now and time.time() - last_snapshot_check >= probe_interval and mtime:
-                last_snapshot_check = time.time()
-                frames = {}
-                try:
-                    _results, errors, frames = self._capture_runtime_snapshots_now(pipeline_video, pipeline_audio, auto_align_profile)
-                    if errors:
-                        self.log("auto snapshot failed: " + "; ".join(f"{kind}: {msg}" for kind, msg in errors.items()))
-                    if ocr_provider_ready(auto_align_profile):
-                        if not pipeline_audio or not pipeline_audio.url:
-                            align_monitor.state = "disabled"
-                            a_msg = "video-only; no audio clock to compare"
-                            new_off = None
-                        else:
-                            new_off, a_msg = self._monitor_alignment_once(
-                                pipeline_video, pipeline_audio, auto_align_profile, align_monitor
-                            )
-                        if new_off is not None:
-                            align_monitor.state = "verifying"
-                            self._set_align_monitor_status(align_monitor, f"{a_msg}; verifying candidate {new_off:.3f}s")
-                            verified, verify_msg = self._verify_alignment_candidate(
-                                pipeline_video, pipeline_audio, auto_align_profile, align_monitor, new_off
-                            )
-                            if not verified:
-                                a_msg = f"{a_msg}; {verify_msg}; keeping current offset"
-                                self.log(f"auto-align: {a_msg}")
-                                self._set_align_monitor_status(align_monitor, a_msg)
-                                continue
-                            a_msg = f"{a_msg}; {verify_msg}"
-                            next_profile = auto_align_profile.copy()
-                            next_profile["offset_seconds"] = new_off
-                            try:
-                                run_id += 1
-                                current_pipeline, mux = self._handoff_pipeline(
-                                    pipeline_video, pipeline_audio, next_profile,
-                                    current_pipeline, mux, f"run_{run_id:03d}", source_cache=source_cache
-                                )
-                                auto_align_profile = next_profile
-                                self._set_current_snapshot_jobs(current_pipeline, auto_align_profile)
-                                self._save_auto_offset(new_off)
-                                align_monitor.mismatch_offsets.clear()
-                                align_monitor.mismatch_count = 0
-                                align_monitor.state = "aligned"
-                                first_segment_deadline = time.time() + timeout
-                                self._set_align_monitor_status(align_monitor, f"{a_msg}; handoff complete")
-                            except Exception as exc:
-                                msg = f"handoff failed: {exc}; keeping current stream"
-                                self.log(msg)
-                                with self.lock:
-                                    self.status["auto_align_msg"] = msg
-                                    self.status["stage"] = "running"
-                                if not isinstance(exc, HandoffDeferred):
-                                    return f"handoff failed: {exc}"
-                        else:
-                            self._set_align_monitor_status(align_monitor, a_msg)
-                finally:
-                    self._cleanup_snapshot_frames(frames)
+            now_ts = time.time()
+            if not source_cache:
+                auto_align.set_state(ALIGN_STATE_DISABLED, "自动对齐依赖本地缓存；当前已暂停", now_ts=now_ts)
+                self._set_align_monitor_status(auto_align.monitor)
+                time.sleep(2)
+                continue
+            if not align_allowed_now and auto_align.monitor.state != ALIGN_STATE_DISABLED:
+                auto_align.monitor.state = ALIGN_STATE_DISABLED
+                self._set_align_monitor_status(auto_align.monitor, "非比赛时间：直播继续，暂停自动截图和对齐")
+            if not align_allowed_now or not ocr_provider_ready(auto_align_profile):
+                self._set_align_monitor_status(auto_align.monitor)
+                time.sleep(2)
+                continue
+            probe_result = auto_align.maybe_probe(now_ts=now_ts, mtime=mtime, timeout=timeout)
+            current_pipeline = auto_align.current_pipeline
+            mux = auto_align.mux
+            auto_align_profile = auto_align.profile
+            first_segment_deadline = auto_align.first_segment_deadline or first_segment_deadline
+            if probe_result:
+                return probe_result
             time.sleep(2)
         return "stopped"
 
@@ -3421,11 +3517,11 @@ class LiveManager:
     # ── Auto-alignment ──────────────────────────────────────────────
 
     def _extract_frame(self, url, at, out_path, timeout, headers=None):
+        timeout = min(coerce_int(timeout, DEFAULT_PROFILE["timeout_seconds"], minimum=5), FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
         subprocess.run([
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-rw_timeout", str(timeout * 1_000_000),
-            *self._http_input_options(url, headers),
-            "-i", url, "-ss", f"{at:.3f}",
+            *self._fast_input_args(url, timeout, headers),
+            "-ss", f"{at:.3f}",
             "-frames:v", "1", "-update", "1", str(out_path),
         ], capture_output=True, timeout=timeout + 10)
 
@@ -3443,10 +3539,7 @@ class LiveManager:
         attempts = [
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-rw_timeout", str(timeout * 1_000_000),
-                *self._http_input_options(url, headers),
-                *self._local_hls_input_options(url, -1),
-                "-i", url,
+                *self._stable_input_args(url, timeout, headers, live_start_index=-1),
                 "-t", f"{duration:.3f}",
                 "-map", "0:v:0",
                 "-an",
@@ -3457,10 +3550,7 @@ class LiveManager:
             ],
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-rw_timeout", str(timeout * 1_000_000),
-                *self._http_input_options(url, headers),
-                *self._local_hls_input_options(url, -1),
-                "-i", url,
+                *self._stable_input_args(url, timeout, headers, live_start_index=-1),
                 "-t", f"{duration:.3f}",
                 "-map", "0:v:0",
                 "-an",
@@ -3515,7 +3605,23 @@ class LiveManager:
         return ClockParse(mins * 60 + secs, m.group(0), "clock")
 
     def _normalize_ocr_text(self, text):
-        return (text or "").strip().replace("O", "0").replace("o", "0").replace("＋", "+")
+        normalized = (text or "").strip().replace("O", "0").replace("o", "0").replace("＋", "+")
+        normalized = re.sub(r"(?i)(?<!\d)\+\s*mins?\.?\s*[:：.]?\s*([0-9]{1,2})(?!\d)", r"+\1", normalized)
+        normalized = re.sub(r"(?i)(?<!\d)mins?\.?\s*[:：.]?\s*([0-9]{1,2})(?!\d)", r"+\1", normalized)
+        return normalized
+
+    def _extract_timer_text(self, text):
+        normalized = self._normalize_ocr_text(text).replace("：", ":")
+        normalized = re.sub(r"(?<=\d)[.](?=\d)", ":", normalized)
+        normalized = re.sub(r"\s*\+\s*", "+", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        compact = normalized.replace(" ", "")
+        for candidate in (compact, normalized):
+            for pattern in TIMER_TEXT_PATTERNS:
+                match = pattern.search(candidate)
+                if match:
+                    return match.group(1)
+        return ""
 
     def _parse_stoppage_ocr_text(self, text):
         normalized = self._normalize_ocr_text(text)
@@ -3528,7 +3634,8 @@ class LiveManager:
                 return parsed
 
         # Scoreboards often OCR as either "45:00 0:32+4" or three separate lines:
-        # "45:00", "0:32", "+4". The elapsed timer is the actual game time offset.
+        # "45:00", "0:32", "+4". The elapsed timer is the actual game time offset;
+        # the trailing +4/+5 is only the announced total stoppage allowance.
         clocks = []
         for m in CLOCK_RE.finditer(normalized):
             mins = int(m.group(1))
@@ -3552,8 +3659,6 @@ class LiveManager:
                 if later_added and elapsed["minute"] > later_added[0]["minute"]:
                     continue
                 label = f"{base['text']}+{elapsed['text']}"
-                if later_added:
-                    label = f"{label}{later_added[0]['text']}"
                 return self._combine_elapsed_stoppage_parts(base["minute"], base["second"], elapsed["minute"], elapsed["second"], label)
 
         lines = [line.strip() for line in normalized.splitlines() if line.strip()]
@@ -3573,8 +3678,6 @@ class LiveManager:
                 added = self._parse_added_time_text(line)
         if base and elapsed:
             label = f"{base['text']}+{elapsed['text']}"
-            if added:
-                label = f"{label}{added['text']}"
             return self._combine_elapsed_stoppage_parts(base["minute"], base["second"], elapsed["minute"], elapsed["second"], label)
 
         return None
@@ -3651,28 +3754,37 @@ class LiveManager:
             return self._ocr_via_ocrspace(frame_path, roi, profile)
         if provider == "custom":
             return self._ocr_via_custom(frame_path, roi, profile)
-        return None
+        return OcrProviderResult()
 
     def _ocrspace_candidate_rois(self, roi, profile):
         candidates = []
+        top_quarter = self._scoreboard_top_quarter_roi()
         try:
             base = parse_roi(roi)
         except (TypeError, ValueError):
             base = None
         if base:
+            base = (
+                max(top_quarter[0], base[0]),
+                max(top_quarter[1], base[1]),
+                min(base[2], top_quarter[2]),
+                min(base[3], max(0.01, top_quarter[3] - max(top_quarter[1], base[1]))),
+            )
+        if base:
             candidates.append(base)
-            candidates.append(self._timer_preview_roi(base))
-            candidates.append(self._scoreboard_scan_roi("left", width=max(0.5, min(1.0, base[2] * 6)), height=max(0.25, min(1.0, base[3] * 6))))
         candidates.extend([
-            self._scoreboard_scan_roi("left"),
-            self._scoreboard_scan_roi("center"),
-            self._scoreboard_scan_roi("right"),
-            (0.0, 0.0, 1.0, 0.5),
-            (0.0, 0.0, 1.0, 1.0),
+            (0.0, 0.0, 1.0, 0.18),
+            top_quarter,
         ])
         seen = set()
         result = []
         for item in candidates:
+            item = (
+                max(0.0, min(1.0, float(item[0]))),
+                max(0.0, min(top_quarter[3], float(item[1]))),
+                max(0.01, min(1.0, float(item[2]))),
+                max(0.01, min(top_quarter[3] - max(0.0, min(top_quarter[3], float(item[1]))), float(item[3]))),
+            )
             key = tuple(round(float(part), 4) for part in item)
             if key in seen:
                 continue
@@ -3712,124 +3824,41 @@ class LiveManager:
         ok, buf = cv2.imencode(".jpg", proc, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         return buf if ok else None
 
-    def _parse_ocr_text_candidates(self, raw_text):
+    def _parse_ocr_text_candidates(self, raw_text, *, allow_timer_only=False):
         text = str(raw_text or "").strip()
         if not text:
-            return None
-        if self._ocr_reply_says_no_scoreboard(text):
-            return None
-        if not self._ocr_reply_has_scoreboard_features(text):
             return None
         parsed = self._parse_clock_text(text)
         if parsed:
             return parsed
+        timer = self._extract_timer_text(text)
+        if timer:
+            parsed = self._parse_clock_text(timer)
+            if parsed:
+                return parsed
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         for line in lines:
-            if self._ocr_reply_says_no_scoreboard(line):
-                continue
             parsed = self._parse_clock_text(line)
             if parsed:
                 return parsed
-        return None
-
-    def _ocr_reply_says_no_scoreboard(self, text):
-        normalized = re.sub(r"[^a-z]+", "", str(text or "").strip().lower())
-        return normalized in {
-            "none",
-            "null",
-            "empty",
-            "unknown",
-            "noscoreboard",
-            "nosoccerscoreboard",
-            "nofootballscoreboard",
-            "nobroadcastscoreboard",
-            "notimer",
-        }
-
-    def _ocr_reply_has_scoreboard_features(self, text):
-        raw = str(text or "").strip()
-        if not raw:
-            return False
-        compact = re.sub(r"\s+", " ", raw)
-        score_pair = None
-        for match in re.finditer(r"(?<!\d)(\d{1,2})\s*[-:]\s*(\d{1,2})(?!\d)", compact):
-            left = int(match.group(1))
-            right = int(match.group(2))
-            if left <= 20 and right <= 20:
-                score_pair = match
-                break
-        team_blocks = re.findall(r"\b[A-Z]{2,4}\b", compact)
-        versus = re.search(r"\b[A-Z][A-Za-z]{1,12}\s+(?:v|vs|VS)\.?\s+[A-Z][A-Za-z]{1,12}\b", compact)
-        has_time = False
-        for line in [compact, *[line.strip() for line in compact.splitlines() if line.strip()]]:
-            if self._parse_clock_text(line):
-                has_time = True
-                break
-        has_score = score_pair is not None
-        has_team_like = len(team_blocks) >= 2 or versus is not None
-        return has_time and (has_score or has_team_like)
-
-    def _is_stoppage_base_clock_text(self, text):
-        parsed = self._parse_clock_text(text)
-        if not parsed or parsed.kind != "clock":
-            return False
-        mins = int(parsed.game_time // 60)
-        secs = int(parsed.game_time % 60)
-        return mins in ADJACENT_STOPPAGE_BASES and secs <= 5
-
-    def _expand_roi(self, roi, *, width_scale=1.0, height_scale=1.0, shift_x=0.0, shift_y=0.0):
-        x, y, w, h = parse_roi(",".join(str(part) for part in roi)) if isinstance(roi, (list, tuple)) else parse_roi(roi)
-        cx = x + w / 2 + shift_x * w
-        cy = y + h / 2 + shift_y * h
-        new_w = min(1.0, w * width_scale)
-        new_h = min(1.0, h * height_scale)
-        new_x = min(max(0.0, cx - new_w / 2), max(0.0, 1.0 - new_w))
-        new_y = min(max(0.0, cy - new_h / 2), max(0.0, 1.0 - new_h))
-        return (new_x, new_y, new_w, new_h)
-
-    def _stoppage_retry_rois(self, roi):
-        base = parse_roi(",".join(str(part) for part in roi)) if isinstance(roi, (list, tuple)) else parse_roi(roi)
-        side_shift = 0.8 if base[0] < 0.5 else -0.8
-        candidates = [
-            self._expand_roi(base, width_scale=2.8, height_scale=1.8),
-            self._expand_roi(base, width_scale=3.6, height_scale=2.2, shift_x=side_shift),
-            self._timer_preview_roi(base),
-        ]
-        return self._dedupe_rois(candidates)
-
-    def _retry_stoppage_with_expanded_roi(self, provider, frame_path, roi, profile):
-        for candidate_roi in self._stoppage_retry_rois(roi):
-            result = self._ocr_region_with_provider(provider, frame_path, candidate_roi, profile)
-            if not result:
-                continue
-            parsed = self._parse_ocr_text_candidates(result[1])
-            if parsed and parsed.kind == "stoppage":
-                return parsed.game_time, parsed.text
+            timer = self._extract_timer_text(line)
+            if timer:
+                parsed = self._parse_clock_text(timer)
+                if parsed:
+                    return parsed
         return None
 
     def _custom_ocr_prompt(self):
         return (
-            "First decide whether this image contains a football or soccer live-match scoreboard with a match timer. "
-            "If there is no football or soccer scoreboard/timer, return ONLY NO_SCOREBOARD. "
-            "If it is not a live football scoreboard, return ONLY NO_SCOREBOARD. "
-            "Only accept it if the same scoreboard also shows team names/abbreviations or a score such as 0-0, 1:0, ENG, BRA. "
-            "If the timer is visible but there are no team names and no score, return ONLY NO_SCOREBOARD. "
-            "Otherwise return ONLY the raw scoreboard text that contains the timer together with the team/score context. "
-            "Examples: ENG 0-0 BRA 45:00, ARS CHE 90:00+02:30, LIV 1-0 MCI 45:00 0:32+4. No explanation."
-        )
-
-    def _custom_scoreboard_side_prompt(self):
-        return (
-            "This image is the top half of a football broadcast frame split into two equal vertical areas. "
-            "Return ONLY 1 if the scoreboard/timer graphic is in the left half. "
-            "Return ONLY 2 if it is in the right half. "
-            "Return ONLY unknown if no scoreboard/timer graphic is visible."
+            "Read the football match timer in this image. "
+            "Return ONLY the timer text exactly as shown, such as 41:12, 90:00, 45:00+02:30, 45:00 0:32+4. "
+            "If no timer is visible, return an empty string."
         )
 
     def _send_custom_ocr_crop(self, crop_img, endpoint, api_key, model, prompt=None):
         import cv2 as _cv2, base64, json as _json, urllib.request
         if crop_img is None or crop_img.size == 0:
-            return None
+            return "", False
         _, buf = _cv2.imencode(".jpg", crop_img, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
         b64 = base64.b64encode(buf).decode("utf-8")
         self._record_ocr_request("custom")
@@ -3883,10 +3912,11 @@ class LiveManager:
                 continue
             reply = self._extract_custom_ocr_text(result)
             if reply:
-                return reply
+                return reply, False
         if last_exc is not None:
             self.log(f"Custom OCR API error: {last_exc}")
-        return None
+            return "", True
+        return "", False
 
     def _extract_custom_ocr_text(self, result):
         if not isinstance(result, dict):
@@ -3914,73 +3944,123 @@ class LiveManager:
             self.status["ocr_request_last_at"] = now()
             self.status["ocr_request_last_provider"] = provider
 
-    def _log_ocr_provider_failure(self, provider):
-        if provider == "ocrspace":
-            self.ocr_provider_cooldowns[provider] = time.time() + OCR_FALLBACK_COOLDOWN_SECONDS
-            self.log("OCR.space failed")
-        elif provider == "custom":
-            self.log("Custom OCR API failed")
+    def _set_ocr_diagnostic(self, kind, *, provider="", note="", error=""):
+        if not kind:
+            return
+        route = ""
+        if provider == "rapidocr_local" and note:
+            route = "remote -> rapidocr_local"
+        elif provider:
+            route = provider
+        with self.lock:
+            self.status.setdefault("last_ocr_diagnostic", {})[kind] = {
+                "provider": provider or "",
+                "note": note or "",
+                "error": error or "",
+                "route": route,
+            }
 
-    def _scoreboard_side_from_ocrspace_ratio(self, left_ratio):
-        if left_ratio is None:
+    def _rapidocr(self):
+        if self.rapidocr_engine is not None:
+            return self.rapidocr_engine
+        if not rapidocr_available():
             return None
-        try:
-            ratio = float(left_ratio)
-        except (TypeError, ValueError):
-            return None
-        if ratio < 0.5:
-            return "left"
-        if ratio >= 0.5:
-            return "right"
-        return None
-
-    def _scoreboard_side_from_custom_reply(self, reply):
-        normalized = re.sub(r"[^0-9a-z]+", "", str(reply or "").strip().lower())
-        if normalized in ("1", "left"):
-            return "left"
-        if normalized in ("2", "right"):
-            return "right"
-        return None
-
-    def _detect_scoreboard_side_via_custom(self, img, endpoint, api_key, model):
-        roi = self._scoreboard_top_half_roi()
-        h, w = img.shape[:2]
-        x, y, rw, rh = roi
-        crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
-        reply = self._send_custom_ocr_crop(crop, endpoint, api_key, model, prompt=self._custom_scoreboard_side_prompt())
-        return self._scoreboard_side_from_custom_reply(reply)
+        with self.ocr_lock:
+            if self.rapidocr_engine is None:
+                self.rapidocr_engine = RapidOCR(config_path=str(RAPIDOCR_CONFIG_PATH))
+        return self.rapidocr_engine
 
     def _ocr_time(self, frame_path, roi, scale=6):
         profile = self.get_profile()
         providers = ocr_provider_order(profile)
-        if not providers or not ocr_provider_ready_for(providers[0], profile):
+        if not providers and not rapidocr_available():
             return None
+        any_request_failure = False
+        any_remote_attempt = False
+        remote_failure_note = ""
         for idx, provider in enumerate(providers):
-            if idx > 0 and not ocr_provider_ready_for(provider, profile):
+            if not ocr_provider_ready_for(provider, profile):
                 continue
-            cooldown_until = float(self.ocr_provider_cooldowns.get(provider, 0) or 0)
-            if idx > 0 and cooldown_until > time.time():
-                continue
+            any_remote_attempt = True
             if idx > 0:
                 self.log(f"OCR primary '{providers[0]}' failed, ROI fallback to '{provider}'")
-            result = self._ocr_region_with_provider(provider, frame_path, roi, profile)
+            provider_result = self._ocr_region_with_provider(provider, frame_path, roi, profile)
+            if provider_result.request_failed:
+                any_request_failure = True
+                remote_failure_note = "remote request failed"
+            result = provider_result.value
             if result:
-                parsed_text = self._parse_ocr_text_candidates(result[1])
-                if not parsed_text:
-                    self._log_ocr_provider_failure(provider)
-                    continue
-                normalized_result = (parsed_text.game_time, parsed_text.text)
-                if self._is_stoppage_base_clock_text(normalized_result[1]):
-                    retried = self._retry_stoppage_with_expanded_roi(provider, frame_path, roi, profile)
-                    if retried:
-                        return retried
-                return normalized_result
-            self._log_ocr_provider_failure(provider)
+                parsed_text = self._parse_ocr_text_candidates(result[1], allow_timer_only=True)
+                if parsed_text:
+                    return parsed_text.game_time, parsed_text.text, provider, ""
+                remote_failure_note = "remote OCR returned text but no valid clock"
+            elif not provider_result.request_failed:
+                remote_failure_note = "remote OCR recognized no valid clock"
+        if providers and not any_request_failure:
+            return None
+        rapid = self._rapidocr_time(frame_path)
+        if rapid:
+            note = "fallback after remote request failure" if any_remote_attempt else ""
+            return rapid[0], rapid[1], "rapidocr_local", note
         return None
+
+    def _rapidocr_variants(self, crop):
+        variants = []
+        raw = crop
+        h, w = raw.shape[:2]
+        if w < 960:
+            scale = 960.0 / max(w, 1)
+            raw = cv2.resize(raw, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        variants.append(raw)
+        gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+        norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        variants.append(cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR))
+        otsu = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        variants.append(cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR))
+        inv = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        variants.append(cv2.cvtColor(inv, cv2.COLOR_GRAY2BGR))
+        return variants
+
+    def _rapidocr_lines(self, result):
+        lines = []
+        if not result:
+            return lines
+        raw_items = result[0] if isinstance(result, tuple) else result
+        if not raw_items:
+            return lines
+        for item in raw_items:
+            if not isinstance(item, (list, tuple)):
+                continue
+            if len(item) >= 3 and isinstance(item[1], str):
+                lines.append(str(item[1]).strip())
+            elif len(item) >= 2 and isinstance(item[0], str):
+                lines.append(str(item[0]).strip())
+        return [line for line in lines if line]
+
+    def _rapidocr_time(self, frame_path):
+        engine = self._rapidocr()
+        if engine is None:
+            return None
+        self._record_ocr_request("rapidocr_local")
+        fallback = None
+        for roi in RAPIDOCR_PRESET_ROIS:
+            crop = self._roi_crop(frame_path, roi)
+            if crop is None:
+                continue
+            for variant in self._rapidocr_variants(crop):
+                result, _elapsed = engine(variant)
+                text = " ".join(self._rapidocr_lines(result)).strip()
+                parsed = self._parse_ocr_text_candidates(text, allow_timer_only=True)
+                if parsed:
+                    if parsed.kind == "stoppage":
+                        return parsed.game_time, parsed.text
+                    if fallback is None:
+                        fallback = (parsed.game_time, parsed.text)
+        return fallback
 
 
     def _ocr_send_ocrspace_jpeg(self, jpeg_buf, api_key):
-        """Send a JPEG buffer to OCR.space, return (text, left_ratio) or None."""
+        """Send a JPEG buffer to OCR.space, return OCR text payload plus request-failure state."""
         import json as _json, urllib.request
         self._record_ocr_request("ocrspace")
         jpeg_data = jpeg_buf.tobytes() if hasattr(jpeg_buf, "tobytes") else bytes(jpeg_buf)
@@ -4024,17 +4104,17 @@ class LiveManager:
                 result = _json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             self.log(f"OCR.space API error: {exc}")
-            return None
+            return OcrProviderResult(request_failed=True)
         if result.get("IsErroredOnProcessing") or result.get("OCRExitCode") != 1:
             err = result.get("ErrorMessage", ["unknown"])[0] if isinstance(result.get("ErrorMessage"), list) else str(result.get("ErrorMessage", "unknown"))
             self.log(f"OCR.space processing error: {err}")
-            return None
+            return OcrProviderResult(request_failed=True)
         parsed_items = result.get("ParsedResults") or []
         if not parsed_items:
-            return None
+            return OcrProviderResult()
         parsed_text = (parsed_items[0].get("ParsedText") or "").strip()
         if not parsed_text:
-            return None
+            return OcrProviderResult()
         left_ratio = None
         overlay = parsed_items[0].get("TextOverlay") or {}
         lines = overlay.get("Lines") or []
@@ -4060,54 +4140,60 @@ class LiveManager:
             if ratio is not None and fallback_ratio is None:
                 fallback_ratio = ratio
             line_text = " ".join(str(word.get("WordText", "")).strip() for word in words).strip()
-            if ratio is not None and self._parse_ocr_text_candidates(line_text):
+            if ratio is not None and self._parse_ocr_text_candidates(line_text, allow_timer_only=False):
                 left_ratio = ratio
                 break
         if left_ratio is None:
             left_ratio = fallback_ratio
-        return parsed_text, left_ratio
+        return OcrProviderResult(value=(parsed_text, left_ratio))
 
     def _ocr_via_ocrspace(self, frame_path, roi, profile):
         """Send one or more crops to OCR.space and return parsed clock."""
         api_key = coerce_text(profile.get("ocrspace_api_key", "")).strip()
         if not api_key:
-            return None
+            return OcrProviderResult()
         img = cv2.imread(str(frame_path))
         if img is None:
-            return None
+            return OcrProviderResult()
+        any_request_failure = False
         for candidate_roi in self._ocrspace_candidate_rois(roi, profile):
             buf = self._prepare_ocrspace_crop(img, candidate_roi)
             if buf is None:
                 continue
             result = self._ocr_send_ocrspace_jpeg(buf, api_key)
-            if result is None:
+            if result.request_failed:
+                any_request_failure = True
                 continue
-            raw_text, _left_ratio = result
-            parsed = self._parse_ocr_text_candidates(raw_text)
+            if result.value is None:
+                continue
+            raw_text, _left_ratio = result.value
+            parsed = self._parse_ocr_text_candidates(raw_text, allow_timer_only=True)
             if parsed:
-                return parsed.game_time, parsed.text
-        return None
+                return OcrProviderResult(value=(parsed.game_time, parsed.text))
+        return OcrProviderResult(request_failed=any_request_failure)
 
     def _find_clock_via_ocrspace(self, frame_path, profile):
         """Read the timer only from the top quarter of the frame."""
         api_key = coerce_text(profile.get("ocrspace_api_key", "")).strip()
         if not api_key:
-            return None
+            return OcrProviderResult()
         img = cv2.imread(str(frame_path))
         if img is None:
-            return None
+            return OcrProviderResult()
         top_quarter_roi = self._scoreboard_top_quarter_roi()
         buf = self._prepare_ocrspace_crop(img, top_quarter_roi)
         if buf is None:
-            return None
+            return OcrProviderResult()
         result = self._ocr_send_ocrspace_jpeg(buf, api_key)
-        if result is None:
-            return None
-        raw_text, _left_ratio = result
-        parsed = self._parse_ocr_text_candidates(raw_text)
+        if result.request_failed:
+            return OcrProviderResult(request_failed=True)
+        if result.value is None:
+            return OcrProviderResult()
+        raw_text, _left_ratio = result.value
+        parsed = self._parse_ocr_text_candidates(raw_text, allow_timer_only=True)
         if parsed:
-            return parsed.game_time, parsed.text, top_quarter_roi
-        return None
+            return OcrProviderResult(value=(parsed.game_time, parsed.text, top_quarter_roi))
+        return OcrProviderResult()
 
     def _ocr_via_custom(self, frame_path, roi, profile):
         """Send cropped region to custom OpenAI-compatible API and return parsed clock."""
@@ -4115,20 +4201,20 @@ class LiveManager:
         api_key = coerce_text(profile.get("ocr_api_key", "")).strip()
         model = coerce_text(profile.get("ocr_custom_model", DEFAULT_PROFILE.get("ocr_custom_model", "gpt-4o"))).strip()
         if not api_key or not endpoint:
-            return None
+            return OcrProviderResult()
         img = cv2.imread(str(frame_path))
         if img is None:
-            return None
+            return OcrProviderResult()
         h, w = img.shape[:2]
         x, y, rw, rh = roi
         crop = img[int(y*h):int((y+rh)*h), int(x*w):int((x+rw)*w)]
-        reply = self._send_custom_ocr_crop(crop, endpoint, api_key, model)
+        reply, request_failed = self._send_custom_ocr_crop(crop, endpoint, api_key, model)
         if not reply:
-            return None
-        parsed = self._parse_ocr_text_candidates(reply)
+            return OcrProviderResult(request_failed=request_failed)
+        parsed = self._parse_ocr_text_candidates(reply, allow_timer_only=True)
         if parsed:
-            return parsed.game_time, parsed.text
-        return None
+            return OcrProviderResult(value=(parsed.game_time, parsed.text))
+        return OcrProviderResult()
 
     def _test_ocr_provider(self, profile):
         provider = normalize_ocr_provider(profile.get("ocr_provider"))
@@ -4156,11 +4242,10 @@ class LiveManager:
             cv2.imwrite(str(tmp_path), img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             messages = []
             success = False
-            for idx, current in enumerate(ocr_provider_order(profile)):
-                label = ocr_provider_label(current)
-                if idx > 0 and not ocr_provider_ready_for(current, profile):
-                    messages.append(f"备用服务({label}) 未配置")
+            for current in ocr_provider_order(profile):
+                if not ocr_provider_ready_for(current, profile):
                     continue
+                label = ocr_provider_label(current)
                 try:
                     if current == "ocrspace":
                         result = self._find_clock_via_ocrspace(tmp_path, profile)
@@ -4172,11 +4257,20 @@ class LiveManager:
                 if result:
                     messages.append(f"{label} 识别成功: {result[1]}")
                     success = True
-                    if idx > 0:
-                        messages.append(f"已使用备用服务 {label}")
                     break
                 if not result:
                     messages.append(f"{label} 识别失败")
+            if not success and rapidocr_available():
+                try:
+                    result = self._rapidocr_time(tmp_path)
+                except Exception as exc:
+                    result = None
+                    messages.append(f"RapidOCR 异常: {str(exc)[:200]}")
+                if result:
+                    messages.append(f"RapidOCR 识别成功: {result[1]}")
+                    success = True
+                else:
+                    messages.append("RapidOCR 识别失败")
             return {"ok": success, "provider": provider, "message": " | ".join(messages) if messages else "OCR 测试失败"}
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -4202,10 +4296,10 @@ class LiveManager:
             return crop if crop.size else None
 
         def _parse_roi(roi):
-            reply = self._send_custom_ocr_crop(_crop_from_roi(roi), endpoint, api_key, model)
+            reply, _request_failed = self._send_custom_ocr_crop(_crop_from_roi(roi), endpoint, api_key, model)
             if not reply:
                 return None
-            return self._parse_ocr_text_candidates(reply)
+            return self._parse_ocr_text_candidates(reply, allow_timer_only=True)
         top_quarter_roi = self._scoreboard_top_quarter_roi()
         parsed_roi = _parse_roi(top_quarter_roi)
         if parsed_roi:
@@ -4231,287 +4325,13 @@ class LiveManager:
             return None
         return (x0 / frame_w, y0 / frame_h, (x1 - x0) / frame_w, (y1 - y0) / frame_h)
 
-    def _clock_candidate_roi_plausible(self, roi, parsed=None):
-        if not roi:
-            return False
-        x, y, w, h = roi
-        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > 1.001 or y + h > 1.001:
-            return False
-        if self._is_scoreboard_top_scan_roi(roi):
-            return True
-        if w < 0.012 or h < 0.010:
-            return False
-        if w > 0.24 or h > 0.20 or w * h > 0.035:
-            return False
-        ratio = w / h
-        if ratio < 0.35 or ratio > 10:
-            return False
-        text = getattr(parsed, "text", "") if parsed else ""
-        if "." in text and ":" not in text and "：" not in text and "+" not in text:
-            # Dot-only OCR hits are common on signs and jersey graphics. Accept them
-            # only when the detected box is still compact and near scoreboard areas.
-            if w > 0.12 or h > 0.10 or y > 0.45:
-                return False
-        return True
 
-    def _collect_clock_samples(self, url, roi, start, end, step, workdir, label, timeout, *, auto_find=False, headers=None):
-        samples = []
-        tasks = {}
-        barrier = threading.Barrier(1)
-        deadline_ns = 0
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            t = start
-            while t <= end + 1e-6:
-                out = workdir / f"{label}_{t:.3f}.jpg"
-                tasks[pool.submit(self._capture_sampled_frame, url, t, out, timeout, headers, barrier, deadline_ns)] = (t, out)
-                t += step
-            for fut in as_completed(tasks):
-                t, out = tasks[fut]
-                try:
-                    fut.result()
-                    parsed = self._ocr_time(out, roi)
-                    if parsed:
-                        samples.append(ClockSample(float(t), parsed[0], parsed[1], roi))
-                    elif auto_find:
-                        found = self._find_frame_clock(out, full_frame=True)
-                        if found:
-                            samples.append(ClockSample(float(t), found.game_time, found.text, found.roi))
-                except Exception:
-                    pass
-        return samples
-
-    def _sample_roi_key(self, sample):
-        if not sample.roi:
-            return None
-        x, y, w, h = sample.roi
-        return (round(x / 0.03), round(y / 0.03), round(w / 0.04), round(h / 0.04))
-
-    def _roi_center_distance(self, left, right):
-        lx, ly, lw, lh = left
-        rx, ry, rw, rh = right
-        return math.hypot((lx + lw / 2) - (rx + rw / 2), (ly + lh / 2) - (ry + rh / 2))
-
-    def _filter_samples_near_roi(self, samples, roi, max_distance=0.18):
-        return [sample for sample in samples if sample.roi and self._roi_center_distance(sample.roi, roi) <= max_distance]
-
-    def _samples_have_plausible_motion(self, samples, scan_window, step):
-        if len(samples) < 2:
-            return False
-        ordered = sorted(samples, key=lambda sample: sample.media_time)
-        times = [sample.game_time for sample in ordered]
-        if max(times) - min(times) < self._clock_motion_threshold(scan_window):
-            return False
-        tolerance = max(1.5, step * 1.2)
-        good_pairs = 0
-        bad_skew = 0
-        for prev, cur in zip(ordered, ordered[1:]):
-            media_delta = cur.media_time - prev.media_time
-            clock_delta = cur.game_time - prev.game_time
-            if clock_delta < -1:
-                return False
-            if abs(media_delta - step) > step * 0.75:
-                bad_skew += 1
-            if abs(clock_delta - media_delta) <= tolerance:
-                good_pairs += 1
-        if bad_skew > max(1, len(ordered) // 3):
-            return False
-        return good_pairs >= max(1, len(ordered) - 2)
-
-    def _dominant_roi(self, samples):
-        grouped = {}
-        for sample in samples:
-            key = self._sample_roi_key(sample)
-            if key is None:
-                continue
-            grouped.setdefault(key, []).append(sample)
-        if not grouped:
-            return None, samples
-        best = max(grouped.values(), key=len)
-        rois = [s.roi for s in best if s.roi]
-        roi = tuple(sum(parts) / len(parts) for parts in zip(*rois))
-        return roi, best
-
-    def _clock_motion_threshold(self, scan_window):
-        return max(1.0, min(5.0, scan_window * 0.6))
-
-    def _maybe_autofind_samples(self, clip, roi, scan_window, step, tmpdir, label, timeout, min_samples, *, allow_relocate=False, preset_rois=None):
-        samples = self._collect_clock_samples(str(clip), roi, 0, scan_window, step, tmpdir, label, timeout)
-        times = [s.game_time for s in samples]
-        motion_threshold = self._clock_motion_threshold(scan_window)
-        if len(samples) >= min_samples and times and max(times) - min(times) >= motion_threshold:
-            return samples, roi, "configured"
-        for idx, preset_roi in enumerate(preset_rois or [], start=1):
-            preset_samples = self._collect_clock_samples(str(clip), preset_roi, 0, scan_window, step, tmpdir, f"{label}_preset_{idx}", timeout)
-            preset_times = [s.game_time for s in preset_samples]
-            if (
-                len(preset_samples) >= min_samples
-                and preset_times
-                and max(preset_times) - min(preset_times) >= motion_threshold
-                and self._samples_have_plausible_motion(preset_samples, scan_window, step)
-            ):
-                return preset_samples, preset_roi, "preset"
-        if not allow_relocate:
-            return samples, roi, "locked"
-        find_window = min(scan_window, step * 2)
-        found = self._collect_clock_samples(str(clip), roi, 0, find_window, step, tmpdir, f"{label}_find", timeout, auto_find=True)
-        raw_found_count = len(found)
-        found_roi, grouped = self._dominant_roi(found)
-        if found_roi and grouped and len(grouped) >= min_samples:
-            refreshed = self._collect_clock_samples(str(clip), found_roi, 0, scan_window, step, tmpdir, f"{label}_auto", timeout)
-            refreshed_times = [s.game_time for s in refreshed]
-            if (
-                len(refreshed) >= min_samples
-                and refreshed_times
-                and max(refreshed_times) - min(refreshed_times) >= motion_threshold
-                and self._samples_have_plausible_motion(refreshed, scan_window, step)
-            ):
-                return refreshed, found_roi, "auto"
-            self.log(f"auto-align: {label} auto-find rejected unstable clock candidate")
-        elif raw_found_count:
-            self.log(f"auto-align: {label} auto-find found {raw_found_count} clock candidates but no stable ROI group")
-        return samples, roi, "configured"
-
-    def _format_roi_value(self, roi):
-        return ",".join(f"{max(0, min(1, part)):.3f}" for part in roi)
-
-    def _save_detected_rois(self, profile, video_roi, audio_roi, video_source, audio_source):
-        updates = {}
-        if video_source in ("auto", "preset") and video_roi:
-            updates["video_roi"] = self._format_roi_value(video_roi)
-        if audio_source in ("auto", "preset") and audio_roi:
-            updates["audio_roi"] = self._format_roi_value(audio_roi)
-        if not updates:
-            return
-        with self.lock:
-            self.profile.update(updates)
-            profile.update(updates)
-            saved = self.profile.copy()
-        json_save(PROFILE_PATH, _strip_url_fields(saved))
-        self.log("auto-align: saved detected ROI " + " ".join(f"{k}={v}" for k, v in updates.items()))
-
-    def _save_monitor_rois(self, profile, monitor):
-        return
-
-    def _estimate_clock_offset(self, video_samples, audio_samples, profile):
-        requested_samples = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"])
-        min_samples = max(3, min(requested_samples, math.ceil(requested_samples * 0.6)))
-        step = coerce_float(profile.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"], minimum=0.5)
-        motion_threshold = self._clock_motion_threshold((requested_samples - 1) * step)
-        max_offset = coerce_float(profile.get("auto_align_max_offset"), DEFAULT_PROFILE["auto_align_max_offset"])
-        if len(video_samples) < min_samples:
-            return None, f"video {len(video_samples)} < {min_samples}"
-        if len(audio_samples) < min_samples:
-            return None, f"audio {len(audio_samples)} < {min_samples}"
-        v_times = [s.game_time for s in video_samples]
-        a_times = [s.game_time for s in audio_samples]
-        if max(v_times) - min(v_times) < motion_threshold:
-            return None, "video clock static"
-        if max(a_times) - min(a_times) < motion_threshold:
-            return None, "audio clock static"
-        candidates = []
-        for vs in video_samples:
-            for aus in audio_samples:
-                offset = aus.media_time - vs.media_time - (aus.game_time - vs.game_time)
-                if abs(offset) <= max_offset:
-                    candidates.append(ClockCandidate(abs(offset), offset, vs, aus))
-        if not candidates:
-            return None, f"no offset within +/-{max_offset}s"
-        candidates.sort(key=lambda c: c.diff)
-        offsets = [c.offset for c in candidates]
-        center = self._offset_cluster_center(offsets)
-        if center is None:
-            return None, f"no stable offset cluster ({len(candidates)} candidates)"
-        cluster = [c for c in candidates if abs(c.offset - center) <= 1.5]
-        if len(cluster) < min_samples:
-            return None, f"cluster {len(cluster)} < {min_samples}"
-        return center, f"aligned ({len(cluster)} matches)"
-
-    def _run_auto_align(self, video_url, audio_url, profile, *, allow_relocate=False):
-        video = video_url if isinstance(video_url, Channel) else Channel(name="video", url=video_url)
-        audio = audio_url if isinstance(audio_url, Channel) else Channel(name="audio", url=audio_url)
-        enabled = ocr_provider_ready(profile)
-        if not enabled:
-            return None, "disabled"
-        sample_count = coerce_int(profile.get("auto_align_samples"), DEFAULT_PROFILE["auto_align_samples"])
-        min_samples = max(3, min(sample_count, math.ceil(sample_count * 0.6)))
-        step = coerce_float(profile.get("auto_align_step"), DEFAULT_PROFILE["auto_align_step"])
-        timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"])
-        threshold = coerce_float(profile.get("auto_align_threshold"), DEFAULT_PROFILE["auto_align_threshold"])
-        video_roi = parse_roi(profile.get("video_roi", "0.050,0.050,0.070,0.050"))
-        audio_roi = parse_roi(profile.get("audio_roi", "0.885,0.085,0.075,0.060"))
-
-        scan_window = (sample_count - 1) * step
-        clip_duration = scan_window + 3
-        with tempfile.TemporaryDirectory(prefix="align_") as tmp:
-            tmpdir = Path(tmp)
-            video_clip = tmpdir / "video.ts"
-            audio_clip = tmpdir / "audio.ts"
-            self.log(f"auto-align: recording {clip_duration:.1f}s clips before OCR")
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futs = [
-                    pool.submit(self._record_alignment_clip, video.url, video_clip, clip_duration, timeout, video.headers),
-                    pool.submit(self._record_alignment_clip, audio.url, audio_clip, clip_duration, timeout, audio.headers),
-                ]
-                try:
-                    for fut in as_completed(futs):
-                        fut.result()
-                except Exception as exc:
-                    msg = f"sample clip failed: {exc}"
-                    self.log(f"auto-align: {msg}; keeping current offset")
-                    return None, msg
-            v_samples, video_roi, video_roi_source = self._maybe_autofind_samples(
-                video_clip, video_roi, scan_window, step, tmpdir, "v", timeout, min_samples,
-                allow_relocate=allow_relocate,
-                preset_rois=parse_roi_list(profile.get("video_roi_presets", "")),
-            )
-            a_samples, audio_roi, audio_roi_source = self._maybe_autofind_samples(
-                audio_clip, audio_roi, scan_window, step, tmpdir, "a", timeout, min_samples,
-                allow_relocate=allow_relocate,
-                preset_rois=parse_roi_list(profile.get("audio_roi_presets", "")),
-            )
-
-        self.log(
-            f"auto-align: v={[(s.media_time, s.text) for s in v_samples]} "
-            f"a={[(s.media_time, s.text) for s in a_samples]} "
-            f"roi=({video_roi_source},{audio_roi_source})"
-        )
-
-        offset, msg = self._estimate_clock_offset(v_samples, a_samples, profile)
-        if offset is None:
-            self.log(f"auto-align: {msg}; keeping current offset")
-            with self.lock:
-                self.status["auto_align_msg"] = msg
-            return None, msg
-
-        current = float(profile.get("offset_seconds", 0))
-        self.log(f"auto-align: offset={offset:.3f}s current={current:.3f}s {msg}")
-
-        json_save(OFFSET_STATE, {
-            "offset_seconds": round(offset, 3),
-            "updated_at_unix": int(time.time()),
-            "source": "auto-align"
-        })
-        with self.lock:
-            self.status["offset_seconds"] = offset
-            self.status["auto_align_offset_seconds"] = round(offset, 3)
-            self.status["auto_align_msg"] = f"offset={offset:.3f}s {msg}"
-            self.status["last_alignment"] = time.strftime("%H:%M:%S", time.localtime())
-        self._save_detected_rois(profile, video_roi, audio_roi, video_roi_source, audio_roi_source)
-
-        if abs(offset - current) >= threshold:
-            self.log(f"auto-align: delta={abs(offset-current):.3f}s >= {threshold}s; restarting")
-            return offset, f"new offset {offset:.3f}s"
-
-        return None, f"stable ({offset:.3f}s)"
     def _snapshot_roi_for_kind(self, profile, kind):
         return self._scoreboard_top_quarter_roi()
 
-    def _save_snapshot_from_frame(self, frame_path, kind, profile, source_name):
+    def _write_snapshot_file(self, frame_path, kind, roi):
         with self.snapshot_file_lock:
             SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-            roi = self._snapshot_roi_for_kind(profile, kind)
-            parsed = self._ocr_time(frame_path, roi)
-            suffix = "timer" if parsed else "full"
             out = SNAPSHOT_DIR / f"{kind}_snapshot.jpg"
             tmp_out = SNAPSHOT_DIR / f".{kind}_snapshot.tmp.jpg"
             crop = self._roi_crop(frame_path, roi)
@@ -4519,28 +4339,93 @@ class LiveManager:
                 cv2.imwrite(str(tmp_out), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             else:
                 shutil.copyfile(frame_path, tmp_out)
-                suffix = "full"
-
             os.replace(tmp_out, out)
             self._prune_snapshots()
-            with self.lock:
-                self.status["last_snapshot_at"] = now()
-                self.status.setdefault("last_ocr_results", {})[kind] = {
-                    "clock": parsed[1] if parsed else None,
-                    "game_time": parsed[0] if parsed else None,
-                    "updated_at": time.strftime("%H:%M:%S", time.localtime()),
-                    "error": "" if parsed else "OCR failed",
-                }
-            detail = parsed[1] if parsed else "full frame"
-            self.log(f"captured {kind} {suffix} snapshot: {out.name} ({detail})")
-            return {"kind": kind, "url": f"/snapshots/{out.name}", "source": source_name, "mode": suffix, "clock": parsed[1] if parsed else ""}
+            return out
+
+    def _save_snapshot_without_ocr(self, frame_path, kind, profile, source_name, *, suffix="manual"):
+        roi = self._snapshot_roi_for_kind(profile, kind)
+        out = self._write_snapshot_file(frame_path, kind, roi)
+        with self.lock:
+            self.status["last_snapshot_at"] = now()
+        self.log(f"captured {kind} {suffix} snapshot: {out.name}")
+        return {"kind": kind, "url": f"/snapshots/{out.name}", "source": source_name, "mode": suffix, "clock": ""}
+
+    def _save_snapshot_from_frame(self, frame_path, kind, profile, source_name):
+        roi = self._snapshot_roi_for_kind(profile, kind)
+        parsed = self._ocr_time(frame_path, roi)
+        suffix = "timer" if parsed else "full"
+        if not parsed:
+            suffix = "full"
+            self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
+        else:
+            self._set_ocr_diagnostic(kind, provider=parsed[2] if len(parsed) > 2 else "", note=parsed[3] if len(parsed) > 3 else "")
+        out = self._write_snapshot_file(frame_path, kind, roi)
+        diagnostic = {}
+        with self.lock:
+            diagnostic = dict((self.status.get("last_ocr_diagnostic") or {}).get(kind) or {})
+        with self.lock:
+            self.status["last_snapshot_at"] = now()
+            self.status.setdefault("last_ocr_results", {})[kind] = {
+                "clock": parsed[1] if parsed else None,
+                "game_time": parsed[0] if parsed else None,
+                "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                "error": "" if parsed else "OCR failed",
+                "provider": diagnostic.get("provider", ""),
+                "note": diagnostic.get("note", ""),
+                "route": diagnostic.get("route", ""),
+                "detail_error": diagnostic.get("error", ""),
+            }
+        detail = parsed[1] if parsed else "full frame"
+        self.log(f"captured {kind} {suffix} snapshot: {out.name} ({detail})")
+        return {"kind": kind, "url": f"/snapshots/{out.name}", "source": source_name, "mode": suffix, "clock": parsed[1] if parsed else ""}
+
+    def _save_probe_snapshot_result(self, frame_path, kind, profile, sample, source_name, *, suffix="timer"):
+        frame_path = Path(frame_path)
+        if not frame_path.exists():
+            self.log(f"skip {kind} {suffix} snapshot: missing frame {frame_path.name}")
+            return None
+        roi = sample.roi if sample and sample.roi else self._snapshot_roi_for_kind(profile, kind)
+        out = self._write_snapshot_file(frame_path, kind, roi)
+        if sample:
+            self._set_ocr_diagnostic(kind, provider=sample.provider, note=sample.note)
+        else:
+            self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
+        diagnostic = {}
+        with self.lock:
+            diagnostic = dict((self.status.get("last_ocr_diagnostic") or {}).get(kind) or {})
+        with self.lock:
+            self.status["last_snapshot_at"] = now()
+            self.status.setdefault("last_ocr_results", {})[kind] = {
+                "clock": sample.text if sample else None,
+                "game_time": sample.game_time if sample else None,
+                "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                "error": "" if sample else "OCR failed",
+                "provider": diagnostic.get("provider", ""),
+                "note": diagnostic.get("note", ""),
+                "route": diagnostic.get("route", ""),
+                "detail_error": diagnostic.get("error", ""),
+            }
+        detail = sample.text if sample else "full frame"
+        self.log(f"captured {kind} {suffix} snapshot: {out.name} ({detail})")
+        return {"kind": kind, "url": f"/snapshots/{out.name}", "source": source_name, "mode": suffix, "clock": sample.text if sample else ""}
+
+    def _save_alignment_pair_snapshots(self, video_frame, audio_frame, profile, video_sample, audio_sample, *, stage):
+        video_kind = "video"
+        audio_kind = "audio"
+        if stage == "candidate":
+            video_kind = "cache_video"
+            audio_kind = "cache_audio"
+        self._save_probe_snapshot_result(video_frame, video_kind, profile, video_sample, f"auto-align {stage} video")
+        self._save_probe_snapshot_result(audio_frame, audio_kind, profile, audio_sample, f"auto-align {stage} audio")
 
     def _capture_url_snapshot(self, kind, url, source_name, profile, headers=None):
         if not url:
             raise RuntimeError(f"{kind} URL is empty")
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
         headers = dict(headers or parse_header_lines(profile.get(f"{kind}_headers", "")))
-        tmp_path = self._capture_snapshot_frame(self._direct_input(url, timeout, headers), timeout)
+        timeout = min(timeout, FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
+        tmp_path = self._capture_snapshot_frame(self._snapshot_input(url, timeout, headers), timeout)
         try:
             return self._save_snapshot_from_frame(tmp_path, kind, profile, source_name)
         finally:
@@ -4566,9 +4451,9 @@ class LiveManager:
         if jobs:
             return jobs
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-        jobs = [("video", self._direct_input(video.url, timeout, video.headers), self.status.get("active_channel") or "active video")]
+        jobs = [("video", self._snapshot_input(video.url, timeout, video.headers), self.status.get("active_channel") or "active video")]
         if audio and audio.url:
-            jobs.append(("audio", self._direct_input(audio.url, timeout, audio.headers), self.status.get("active_audio_channel") or profile.get("audio_channel") or "active audio"))
+            jobs.append(("audio", self._snapshot_input(audio.url, timeout, audio.headers), self.status.get("active_audio_channel") or profile.get("audio_channel") or "active audio"))
         return jobs
 
     def _capture_snapshot_frames(self, jobs, profile):
@@ -4577,7 +4462,7 @@ class LiveManager:
         errors = {}
         if not jobs:
             return frames, {"snapshot": "no snapshot URLs available"}
-        timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        timeout = min(coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5), FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
         with ThreadPoolExecutor(max_workers=min(2, len(jobs))) as pool:
             futures = {
                 pool.submit(self._capture_snapshot_frame, input_args, timeout): (kind, source_name)
@@ -4591,7 +4476,7 @@ class LiveManager:
                     errors[kind] = str(exc)
         return frames, errors
 
-    def _save_snapshot_frames(self, frames, profile):
+    def _save_snapshot_frames(self, frames, profile, *, run_ocr=True, suffix="manual"):
         results = {}
         errors = {}
         for kind in SNAPSHOT_KINDS:
@@ -4599,7 +4484,10 @@ class LiveManager:
                 continue
             frame_path, source_name = frames[kind]
             try:
-                results[kind] = self._save_snapshot_from_frame(frame_path, kind, profile, source_name)
+                if run_ocr:
+                    results[kind] = self._save_snapshot_from_frame(frame_path, kind, profile, source_name)
+                else:
+                    results[kind] = self._save_snapshot_without_ocr(frame_path, kind, profile, source_name, suffix=suffix)
             except Exception as exc:
                 errors[kind] = str(exc)
         return results, errors
@@ -4611,7 +4499,7 @@ class LiveManager:
     def _capture_snapshot_jobs(self, jobs, profile):
         frames, errors = self._capture_snapshot_frames(jobs, profile)
         try:
-            results, save_errors = self._save_snapshot_frames(frames, profile)
+            results, save_errors = self._save_snapshot_frames(frames, profile, run_ocr=False, suffix="manual")
             errors.update(save_errors)
         finally:
             self._cleanup_snapshot_frames(frames)
@@ -4676,15 +4564,13 @@ class LiveManager:
                 jobs = []
                 timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
                 video_channel = self._resolve_snapshot_channel("video", profile, force=True)
-                jobs.append(("cache_video", self._direct_input(video_channel.url, timeout, video_channel.headers), f"{video_channel.name} 原始"))
-                jobs.append(("video", self._direct_input(video_channel.url, timeout, video_channel.headers), f"{video_channel.name} 延迟后"))
+                jobs.append(("cache_video", self._snapshot_input(video_channel.url, timeout, video_channel.headers), f"{video_channel.name} 原始"))
                 try:
                     audio_channel = self._resolve_snapshot_channel("audio", profile, force=True)
                 except Exception:
                     audio_channel = None
                 if audio_channel and audio_channel.url:
-                    jobs.append(("cache_audio", self._direct_input(audio_channel.url, timeout, audio_channel.headers), f"{audio_channel.name} 原始"))
-                    jobs.append(("audio", self._direct_input(audio_channel.url, timeout, audio_channel.headers), f"{audio_channel.name} 延迟后"))
+                    jobs.append(("cache_audio", self._snapshot_input(audio_channel.url, timeout, audio_channel.headers), f"{audio_channel.name} 原始"))
             results, errors = self._capture_snapshot_jobs(jobs, profile)
         finally:
             self.snapshot_lock.release()
@@ -4694,26 +4580,6 @@ class LiveManager:
             "snapshots": [results[kind] for kind in SNAPSHOT_KINDS if kind in results],
             "errors": errors,
         }
-
-    def capture_snapshot(self, kind):
-        profile = self.get_profile()
-        if not self.snapshot_lock.acquire(timeout=5):
-            raise RuntimeError("snapshot capture already running")
-        try:
-            with self.lock:
-                jobs = [job for job in self.current_snapshot_jobs if job[0] == kind]
-            if jobs:
-                _kind, input_args, source_name = jobs[0]
-                timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-                frame = self._capture_snapshot_frame(input_args, timeout)
-                try:
-                    return self._save_snapshot_from_frame(frame, kind, profile, source_name)
-                finally:
-                    frame.unlink(missing_ok=True)
-            channel = self._resolve_snapshot_channel(kind, profile, force=True)
-            return self._capture_url_snapshot(kind, channel.url, channel.name, profile, channel.headers)
-        finally:
-            self.snapshot_lock.release()
 
     def clear_runtime(self, target):
         if target == "hls":
@@ -4930,8 +4796,8 @@ class LiveManager:
         if meta.get("status") in {"starting", "running", "stopping"}:
             raise RuntimeError("recording is still running")
         output_format = str(output_format or "mkv").strip().lower()
-        if output_format not in {"mkv", "mp4"}:
-            raise RuntimeError("output_format must be mkv or mp4")
+        if output_format != "mkv":
+            raise RuntimeError("output_format must be mkv")
         session_dir = self._recording_dir(session_id)
         playlist_path = self._recording_playlist_path(session_id)
         if not playlist_path.exists():
@@ -5046,10 +4912,6 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(MANAGER.get_public_profile())
         if path == "/api/logs":
             return self.send_json({"lines": list(MANAGER.logs)})
-        if path == "/api/timer-rois":
-            return self.send_json({"entries": MANAGER._timer_roi_entries()})
-        if path == "/api/roi":
-            return self.send_json(MANAGER.roi)
         if path == "/api/recordings":
             return self.send_json(MANAGER.list_recordings())
         if path == "/api/snapshots":
@@ -5084,11 +4946,6 @@ class Handler(SimpleHTTPRequestHandler):
             if not target.exists() and path == "/index.m3u8":
                 return self.send_text("HLS playlist is not ready\n", "text/plain; charset=utf-8", status=HTTPStatus.SERVICE_UNAVAILABLE, extra_headers={"Retry-After": "2"})
             return self.send_file(target)
-        if path.startswith("/roi-previews/"):
-            try:
-                return self.send_file(safe_child_path(ROI_PREVIEW_DIR, path.removeprefix("/roi-previews/")))
-            except PermissionError:
-                return self.send_error(HTTPStatus.NOT_FOUND)
         if path.startswith("/snapshots/"):
             try:
                 return self.send_file(safe_child_path(SNAPSHOT_DIR, path.removeprefix("/snapshots/")))
@@ -5114,13 +4971,13 @@ class Handler(SimpleHTTPRequestHandler):
                 MANAGER.start()
                 return self.send_json(MANAGER.get_status())
             if path == "/api/restart":
-                MANAGER.restart(data if data else None)
+                payload = dict(data or {})
+                clean = parse_bool(payload.pop("clean", False))
+                MANAGER.restart(payload if payload else None, clean=clean)
                 return self.send_json(MANAGER.get_status())
             if path == "/api/stop":
                 MANAGER.stop(source="manual")
                 return self.send_json(MANAGER.get_status())
-            if path == "/api/snapshot":
-                return self.send_json(MANAGER.capture_snapshot(data.get("kind", "video")))
             if path == "/api/snapshots/capture":
                 return self.send_json(MANAGER.capture_snapshots())
             if path == "/api/schedule/refresh":
@@ -5138,14 +4995,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(MANAGER.merge_recording(data.get("session_id", ""), data.get("output_format", "mkv")))
             if path == "/api/clear":
                 return self.send_json(MANAGER.clear_runtime(data.get("target", "")))
-            if path == "/api/timer-rois/delete":
-                return self.send_json(MANAGER.delete_timer_roi(data.get("key", ""), roi=data.get("roi", True), preview=data.get("preview", True)))
-            if path == "/api/timer-rois/delete-preview":
-                return self.send_json(MANAGER.delete_timer_roi(data.get("key", ""), roi=False, preview=True))
-            if path == "/api/roi":
-                MANAGER.roi = data
-                json_save(ROI_PATH, data)
-                return self.send_json(data)
         except Exception as exc:
             MANAGER.log(f"api error {path}: {exc}")
             return self.send_json({"error": str(exc)}, status=500)
