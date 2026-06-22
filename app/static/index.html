@@ -208,7 +208,7 @@
             </section>
 
             <section class="view" data-view="sources">
-              <div class="panel-grid">
+              <div class="panel-grid sources-top-grid">
                 <section class="panel">
                   <div class="panel-head">
                     <div>
@@ -314,7 +314,6 @@
                   <div class="form-grid">
                     <label class="field full checkbox-field"><input name="local_cache_enabled" type="checkbox" /> <span>低请求本地缓存（不转码）</span></label>
                     <label class="field"><span>本地缓存秒数</span><input name="local_cache_seconds" type="number" min="30" /></label>
-                    <label class="field"><span>调试延时（秒，正数延视频，负数延音频）</span><input name="debug_cache_delay_seconds" type="number" step="1" /></label>
                     <label class="field"><span>截图/检查间隔（秒）</span><input name="auto_align_interval" type="number" min="5" /></label>
                     <label class="field"><span>允许误差（秒）</span><input name="auto_align_threshold" type="number" step="0.1" min="0.1" /></label>
                     <label class="field"><span>最大偏移（秒）</span><input name="auto_align_max_offset" type="number" step="1" min="1" /></label>
@@ -365,26 +364,28 @@
                     </div>
                   </div>
                   <div class="recording-workspace">
-                    <div class="recording-layout">
-                      <div class="recording-controls">
-                        <div class="recording-toolbar">
-                          <button id="startRecording" type="button">开始录制</button>
-                          <button id="stopRecording" class="secondary" type="button">停止录制</button>
-                        </div>
+                    <div class="recording-controls">
+                      <div class="recording-toolbar">
+                        <button id="startRecording" type="button">开始录制</button>
+                        <button id="stopRecording" class="secondary" type="button">停止录制</button>
+                      </div>
+                      <div class="recording-status-row">
                         <div class="recording-policy">
                           <label class="field full checkbox-field"><input name="schedule_recording_enabled" type="checkbox" /> <span>随赛程自动开始/停止录制</span></label>
                         </div>
                         <div id="recordingStatus" class="recording-status">未开始</div>
                       </div>
-                      <div class="recording-selection">
-                        <div class="recording-selection-head">
-                          <span>今明两天比赛选择</span>
-                          <small>仅用于随赛程自动录制，不影响直播自动启停。</small>
-                        </div>
-                        <div id="scheduleMatchPicker" class="stacked-options">今明两天暂无可选比赛。</div>
-                      </div>
                     </div>
-                    <div id="recordingList" class="recording-list"></div>
+                    <div class="recording-side">
+                      <div id="recordingList" class="recording-list"></div>
+                    </div>
+                    <div class="recording-selection recording-selection-full">
+                      <div class="recording-selection-head">
+                        <span>今明两天比赛选择</span>
+                        <small>仅用于随赛程自动录制，不影响直播自动启停。</small>
+                      </div>
+                      <div id="scheduleMatchPicker" class="stacked-options">今明两天暂无可选比赛。</div>
+                    </div>
                   </div>
                 </section>
               </div>

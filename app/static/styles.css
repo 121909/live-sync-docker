@@ -358,6 +358,10 @@ h3 {
   align-items: start;
 }
 
+.sources-top-grid {
+  grid-template-columns: 1fr;
+}
+
 .panel,
 .hero-card {
   min-width: 0;
@@ -893,28 +897,28 @@ h3 {
 
 .recording-workspace {
   display: grid;
-  gap: 16px;
-}
-
-.recording-layout {
-  display: grid;
-  grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.25fr);
+  grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.15fr);
   gap: 16px;
   align-items: start;
 }
 
 .recording-controls,
+.recording-side,
 .recording-selection,
 .recording-policy {
   display: grid;
   gap: 12px;
 }
 
+.recording-status-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 12px;
+  align-items: stretch;
+}
+
 .recording-policy {
-  padding: 14px 16px;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.68);
+  min-width: 0;
 }
 
 .recording-selection {
@@ -926,13 +930,17 @@ h3 {
 
 .recording-selection .stacked-options {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
   gap: 12px;
 }
 
 .recording-selection .checkbox-field {
   min-height: 100%;
   align-items: flex-start;
+}
+
+.recording-selection-full {
+  grid-column: 1 / -1;
 }
 
 .recording-selection-head {
@@ -961,6 +969,8 @@ h3 {
   background: rgba(255, 255, 255, 0.72);
   color: var(--text);
   font-weight: 600;
+  display: grid;
+  align-content: center;
 }
 
 .recording-row {
@@ -1067,6 +1077,10 @@ pre {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
+  .recording-selection .stacked-options {
+    grid-template-columns: 1fr;
+  }
+
   .hero-grid,
   .panel-grid,
   .browser-grid {
@@ -1121,7 +1135,11 @@ pre {
   .status-grid,
   .form-grid,
   .ocr-results,
-  .recording-layout {
+  .recording-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .recording-status-row {
     grid-template-columns: 1fr;
   }
 

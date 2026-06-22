@@ -29,7 +29,6 @@ const profileFields = [
   "ocr_custom_model",
   "local_cache_enabled",
   "local_cache_seconds",
-  "debug_cache_delay_seconds",
   "auto_align_interval",
   "auto_align_threshold",
   "auto_align_max_offset",
@@ -181,7 +180,7 @@ function profileFromForm() {
         .split("\n")
         .map((item) => item.trim())
         .filter(Boolean);
-    } else if (["offset_seconds", "segment_time", "auto_align_threshold", "auto_align_max_offset", "debug_cache_delay_seconds"].includes(name)) {
+    } else if (["offset_seconds", "segment_time", "auto_align_threshold", "auto_align_max_offset"].includes(name)) {
       profile[name] = Number(el.value || 0);
     } else if ([
       "timeout_seconds",

@@ -17,9 +17,7 @@ ALIGN_MAX_FINISH_DELTA_SECONDS = 1.0
 ALIGN_CANDIDATE_SAMPLE_COUNT = 1
 ALIGN_VERIFY_SAMPLE_COUNT = 1
 ALIGN_SAMPLE_SPACING_SECONDS = 0.0
-# Avoid grabbing the freshest live-edge segment directly; backing off by a
-# couple of segments is more stable for copied local HLS caches.
-ALIGN_FRAME_LIVE_START_INDEX = -3
+ALIGN_REVERIFY_FAILURES_BEFORE_REPROBE = 3
 
 
 @dataclass
@@ -274,12 +272,39 @@ class AutoAlignController:
         self.schedule_probe(self.probe_interval(), now_ts=now_ts)
         self.set_state(ALIGN_STATE_ALIGNED, f"aligned at {offset:.3f}s", now_ts=now_ts)
 
+    def should_reprobe_candidate(self):
+        if self.monitor.last_successful_offset is None:
+            return True
+        return self.monitor.consecutive_failures >= ALIGN_REVERIFY_FAILURES_BEFORE_REPROBE
+
+    def verify_current_offset(self, now_ts: float):
+        current = float(self.profile.get("offset_seconds", 0) or 0)
+        self.set_state(ALIGN_STATE_VERIFYING, f"verifying current offset {current:.3f}s", now_ts=now_ts)
+        self.monitor.last_verify_at = now_ts
+        self.publish_status()
+        verified, verify_msg = self.verify_candidate(current)
+        if verified:
+            self.register_success(current, now_ts=now_ts)
+            self.publish_status(verify_msg)
+            return None
+        self.register_failure(
+            f"{verify_msg}; keeping current offset",
+            now_ts=now_ts,
+            state=ALIGN_STATE_WAITING,
+        )
+        self.log(f"auto-align: {self.monitor.message}")
+        self.publish_status()
+        return None
+
     def maybe_probe(self, *, now_ts: float, mtime: float | None, timeout: int):
         if self.monitor.next_probe_at <= 0:
             self.schedule_probe(self.probe_interval(), now_ts=now_ts)
         if not mtime or now_ts < self.monitor.next_probe_at:
             self.publish_status()
             return None
+
+        if not self.should_reprobe_candidate():
+            return self.verify_current_offset(now_ts)
 
         self.set_state(ALIGN_STATE_PROBING, "capturing probe frames", now_ts=now_ts)
         self.publish_status()
