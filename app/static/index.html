@@ -223,7 +223,7 @@
                     <label class="field"><span>初始偏移秒</span><input name="offset_seconds" type="number" step="0.1" /></label>
                     <label class="field"><span>源超时（秒）</span><input name="timeout_seconds" type="number" min="5" /></label>
                     <label class="field"><span>失败重试次数</span><input name="retry_limit" type="number" min="1" /></label>
-                    <label class="field"><span>分片时长（秒）</span><input name="segment_time" type="number" step="0.1" min="1" /></label>
+                    <label class="field"><span>最终输出分片时长（秒）</span><input name="segment_time" type="number" step="0.1" min="0.5" /></label>
                     <label class="field"><span>播放列表分片数</span><input name="playlist_size" type="number" min="3" /></label>
                   </div>
                 </section>
@@ -313,6 +313,7 @@
                   </div>
                   <div class="form-grid">
                     <label class="field full checkbox-field"><input name="local_cache_enabled" type="checkbox" /> <span>低请求本地缓存（不转码）</span></label>
+                    <label class="field"><span>本地缓存分片时长（秒）</span><input name="source_cache_segment_time" type="number" step="0.1" min="0.5" /></label>
                     <label class="field"><span>本地缓存秒数</span><input name="local_cache_seconds" type="number" min="30" /></label>
                     <label class="field"><span>截图/检查间隔（秒）</span><input name="auto_align_interval" type="number" min="5" /></label>
                     <label class="field"><span>允许误差（秒）</span><input name="auto_align_threshold" type="number" step="0.1" min="0.1" /></label>
@@ -334,11 +335,11 @@
                   <div class="panel-head">
                     <div>
                       <p class="eyebrow">Snapshots</p>
-                      <h3>截图与 OCR</h3>
+                      <h3>缓存与预览截图</h3>
                     </div>
                     <button id="shotBoth" type="button">同步截图</button>
                   </div>
-                  <p class="hint">同步截图只会临时刷新缓存前图片，不做 OCR；下一轮自动对齐会用自己的 candidate / verify 截图覆盖对应槽位。</p>
+                  <p class="hint">同步截图会同时刷新上游缓存截图和当前 offset 预览截图；自动对齐仍只用上游缓存截图做 OCR。</p>
                   <div id="ocrResults" class="ocr-results"></div>
                   <div id="snapshotGallery" class="snapshots"></div>
                 </section>

@@ -6,7 +6,6 @@ from typing import Any
 
 ALIGN_STATE_WAITING = "waiting"
 ALIGN_STATE_PROBING = "probing"
-ALIGN_STATE_VERIFYING = "verifying"
 ALIGN_STATE_ALIGNED = "aligned"
 ALIGN_STATE_DISABLED = "disabled"
 ALIGN_STATE_CAPTURE_FAILED = "capture_failed"
@@ -15,9 +14,7 @@ ALIGN_RETRY_BACKOFF_MAX_SECONDS = 600
 ALIGN_MAX_CAPTURE_SKEW_SECONDS = 1.0
 ALIGN_MAX_FINISH_DELTA_SECONDS = 1.0
 ALIGN_CANDIDATE_SAMPLE_COUNT = 1
-ALIGN_VERIFY_SAMPLE_COUNT = 1
 ALIGN_SAMPLE_SPACING_SECONDS = 0.0
-ALIGN_REVERIFY_FAILURES_BEFORE_REPROBE = 3
 
 
 @dataclass
@@ -52,6 +49,7 @@ class AlignmentMonitor:
     current_offset: float = 0.0
     video_channel: str = ""
     audio_channel: str = ""
+    candidate_recovery_hold: bool = False
 
     def locked(self):
         return self.state == ALIGN_STATE_ALIGNED
@@ -79,6 +77,7 @@ class AlignmentMonitor:
             "next_probe_at": self.next_probe_at,
             "current_offset": self.current_offset,
             "last_candidate_offset": self.last_candidate_offset,
+            "candidate_recovery_hold": self.candidate_recovery_hold,
         }
 
 
@@ -150,15 +149,6 @@ class AutoAlignController:
     def pair_capture_skew(self, video_cap, audio_cap):
         return self.manager.auto_align_pair_capture_skew(video_cap, audio_cap)
 
-    def verify_candidate(self, candidate: float):
-        return self.manager.auto_align_verify_candidate(
-            self.pipeline_video,
-            self.pipeline_audio,
-            self.profile,
-            self.monitor,
-            candidate,
-        )
-
     def handoff_candidate(self, next_profile: dict):
         return self.manager.auto_align_handoff_candidate(
             self.pipeline_video,
@@ -196,6 +186,8 @@ class AutoAlignController:
             max_offset = 1.0
         if abs(candidate) > max_offset:
             return False, f"candidate {candidate:.3f}s exceeds +/-{max_offset}s"
+        if abs(candidate - current) <= 1.0:
+            return False, f"delta {abs(candidate-current):.3f}s <= 1.000s"
         threshold = float(self.profile.get("auto_align_threshold", 0) or 0)
         if threshold < 0.1:
             threshold = 0.1
@@ -259,6 +251,7 @@ class AutoAlignController:
     def register_failure(self, message: str, *, now_ts: float | None = None, state: str | None = None):
         self.monitor.consecutive_failures += 1
         self.monitor.retry_backoff_seconds = self.alignment_backoff_seconds(self.monitor.consecutive_failures)
+        self.monitor.candidate_recovery_hold = True
         delay = self.monitor.retry_backoff_seconds or self.probe_interval()
         self.schedule_probe(delay, now_ts=now_ts)
         self.set_state(state or ALIGN_STATE_WAITING, message, now_ts=now_ts)
@@ -266,35 +259,12 @@ class AutoAlignController:
     def register_success(self, offset: float, *, now_ts: float | None = None):
         self.monitor.consecutive_failures = 0
         self.monitor.retry_backoff_seconds = 0
+        self.monitor.candidate_recovery_hold = False
         self.monitor.last_successful_offset = offset
         self.monitor.current_offset = offset
         self.monitor.mismatch_count = 0
         self.schedule_probe(self.probe_interval(), now_ts=now_ts)
         self.set_state(ALIGN_STATE_ALIGNED, f"aligned at {offset:.3f}s", now_ts=now_ts)
-
-    def should_reprobe_candidate(self):
-        if self.monitor.last_successful_offset is None:
-            return True
-        return self.monitor.consecutive_failures >= ALIGN_REVERIFY_FAILURES_BEFORE_REPROBE
-
-    def verify_current_offset(self, now_ts: float):
-        current = float(self.profile.get("offset_seconds", 0) or 0)
-        self.set_state(ALIGN_STATE_VERIFYING, f"verifying current offset {current:.3f}s", now_ts=now_ts)
-        self.monitor.last_verify_at = now_ts
-        self.publish_status()
-        verified, verify_msg = self.verify_candidate(current)
-        if verified:
-            self.register_success(current, now_ts=now_ts)
-            self.publish_status(verify_msg)
-            return None
-        self.register_failure(
-            f"{verify_msg}; keeping current offset",
-            now_ts=now_ts,
-            state=ALIGN_STATE_WAITING,
-        )
-        self.log(f"auto-align: {self.monitor.message}")
-        self.publish_status()
-        return None
 
     def maybe_probe(self, *, now_ts: float, mtime: float | None, timeout: int):
         if self.monitor.next_probe_at <= 0:
@@ -303,10 +273,13 @@ class AutoAlignController:
             self.publish_status()
             return None
 
-        if not self.should_reprobe_candidate():
-            return self.verify_current_offset(now_ts)
-
         self.set_state(ALIGN_STATE_PROBING, "capturing probe frames", now_ts=now_ts)
+        self.monitor.verify_video_clock = ""
+        self.monitor.verify_audio_clock = ""
+        self.monitor.verify_message = ""
+        self.monitor.verify_delta = None
+        self.monitor.verify_video_seconds_back = None
+        self.monitor.verify_audio_seconds_back = None
         self.publish_status()
         try:
             readings, error = self.collect_probe_readings(
@@ -334,27 +307,22 @@ class AutoAlignController:
             new_off,
             float(self.profile.get("offset_seconds", 0) or 0),
         )
+        if new_off is not None and accepted and self.monitor.candidate_recovery_hold:
+            self.monitor.candidate_recovery_hold = False
+            self.schedule_probe(self.probe_interval(), now_ts=now_ts)
+            hold_msg = f"{a_msg}; recovery hold after OCR failure"
+            self.log(f"auto-align: {hold_msg}")
+            self.set_state(ALIGN_STATE_WAITING, hold_msg, now_ts=now_ts)
+            self.publish_status()
+            return None
         if new_off is None or not accepted:
             self.schedule_probe(self.probe_interval(), now_ts=now_ts)
             self.set_state(ALIGN_STATE_WAITING, a_msg if new_off is None else accept_msg, now_ts=now_ts)
             self.publish_status()
             return None
 
-        self.set_state(ALIGN_STATE_VERIFYING, f"{a_msg}; verifying candidate {new_off:.3f}s", now_ts=now_ts)
-        self.monitor.last_verify_at = now_ts
+        self.set_state(ALIGN_STATE_PROBING, f"{a_msg}; handoff candidate {new_off:.3f}s", now_ts=now_ts)
         self.publish_status()
-        verified, verify_msg = self.verify_candidate(new_off)
-        if not verified:
-            self.register_failure(
-                f"{a_msg}; {verify_msg}; keeping current offset",
-                now_ts=now_ts,
-                state=ALIGN_STATE_WAITING,
-            )
-            self.log(f"auto-align: {self.monitor.message}")
-            self.publish_status()
-            return None
-
-        a_msg = f"{a_msg}; {verify_msg}"
         next_profile = self.profile.copy()
         next_profile["offset_seconds"] = new_off
         try:

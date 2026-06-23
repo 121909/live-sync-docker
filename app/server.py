@@ -41,7 +41,6 @@ from .auto_align import (
     ALIGN_STATE_DISABLED,
     ALIGN_STATE_ALIGNED,
     ALIGN_STATE_PROBING,
-    ALIGN_STATE_VERIFYING,
     ALIGN_STATE_WAITING,
     AlignmentMonitor,
     AutoAlignController,
@@ -105,7 +104,6 @@ HLS_RECOVERY_WINDOW_SECONDS = int(os.environ.get("HLS_RECOVERY_WINDOW_SECONDS", 
 HLS_CLIENT_GRACE_SECONDS = int(os.environ.get("HLS_CLIENT_GRACE_SECONDS", "240") or 240)
 FFMPEG_FAST_TIMEOUT_CAP_SECONDS = 10
 ALIGN_CAPTURE_ANCHOR_MARGIN_SECONDS = 6.0
-
 
 def env(name, default=""):
     return os.environ.get(name, default)
@@ -264,6 +262,7 @@ def make_default_profile():
         "offset_seconds": load_offset_default(),
         "retry_limit": int(env("RETRY_LIMIT", "3") or 3),
         "timeout_seconds": int(env("TIMEOUT_SECONDS", "25") or 25),
+        "source_cache_segment_time": float(env("SOURCE_CACHE_SEGMENT_TIME", "1") or 1),
         "segment_time": float(env("SEGMENT_TIME", "4") or 4),
         "playlist_size": int(env("PLAYLIST_SIZE", "60") or 60),
         "hls_segment_type": env("HLS_SEGMENT_TYPE", "auto").lower(),
@@ -355,20 +354,32 @@ def coerce_float(value, default, minimum=None):
     return result
 
 
+def effective_source_cache_segment_time(profile):
+    return coerce_float(
+        profile.get("source_cache_segment_time"),
+        DEFAULT_PROFILE["source_cache_segment_time"],
+        minimum=0.5,
+    )
+
+
+def effective_output_segment_time(profile):
+    return coerce_float(profile.get("segment_time"), DEFAULT_PROFILE["segment_time"], minimum=0.5)
+
+
 def effective_segment_time(profile):
-    return max(coerce_float(profile.get("segment_time"), DEFAULT_PROFILE["segment_time"], minimum=0.5), 4.0)
+    return effective_output_segment_time(profile)
 
 
 def hls_stall_timeout(profile):
     input_timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-    segment_seconds = effective_segment_time(profile)
+    segment_seconds = effective_output_segment_time(profile)
     return max(input_timeout, int(math.ceil(segment_seconds * 4)))
 
 
 def startup_hls_wait_timeout(profile):
     base = hls_stall_timeout(profile)
     offset = abs(coerce_float(profile.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"]))
-    segment_seconds = effective_segment_time(profile)
+    segment_seconds = effective_output_segment_time(profile)
     extra = max(0, int(math.ceil(offset + segment_seconds * 1.5))) if offset >= 0.5 else 0
     return base + extra
 
@@ -573,7 +584,7 @@ LOCAL_CACHE_MAX_SECONDS = 600
 
 
 def effective_local_cache_seconds(profile):
-    segment = effective_segment_time(profile)
+    segment = effective_source_cache_segment_time(profile)
     configured = coerce_int(profile.get("local_cache_seconds"), DEFAULT_PROFILE["local_cache_seconds"], minimum=30)
     offset = abs(coerce_float(profile.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"]))
     # Honor the configured cache depth so upstream jitter/short stalls are
@@ -585,7 +596,19 @@ def effective_local_cache_seconds(profile):
 
 
 def local_cache_list_size(profile):
-    return max(8, int(math.ceil(effective_local_cache_seconds(profile) / effective_segment_time(profile))) + 4)
+    return max(8, int(math.ceil(effective_local_cache_seconds(profile) / effective_source_cache_segment_time(profile))) + 4)
+
+
+def live_edge_guard_segments():
+    return 3
+
+
+def delay_offset_segments(profile):
+    offset = abs(coerce_float(profile.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"]))
+    segment = effective_source_cache_segment_time(profile)
+    if segment <= 0:
+        return 0
+    return max(0, int(round(offset / segment)))
 
 
 def _strip_url_fields(profile):
@@ -722,6 +745,13 @@ class PlaylistProgramWindow:
 
 
 @dataclass(frozen=True)
+class PlaylistProgramSegment:
+    start_time: float
+    end_time: float
+    duration: float
+
+
+@dataclass(frozen=True)
 class PipelineFailure:
     reason: str
     kind: str = "unknown"
@@ -745,6 +775,10 @@ class PreparedPipeline:
     channel_prefers_fmp4: bool = False
     video_input_label: str = "direct video"
     audio_input_label: str = "direct audio"
+    video_live_start_index: int | None = None
+    audio_live_start_index: int | None = None
+    video_seek_seconds: float = 0.0
+    audio_seek_seconds: float = 0.0
     video_snapshot_input: list = field(default_factory=list)
     audio_snapshot_input: list = field(default_factory=list)
     snapshot_jobs: list = field(default_factory=list)
@@ -1075,6 +1109,7 @@ class LiveManager:
             "auto_align_offset_seconds": None,
             "last_snapshot_at": None,
             "last_ocr_results": {kind: None for kind in SNAPSHOT_KINDS},
+            "last_valid_ocr_results": {kind: None for kind in SNAPSHOT_KINDS},
             "last_ocr_diagnostic": {},
             "ocr_request_count": 0,
             "ocr_request_last_at": None,
@@ -1197,7 +1232,8 @@ class LiveManager:
         merged["offset_seconds"] = coerce_float(merged.get("offset_seconds"), DEFAULT_PROFILE["offset_seconds"])
         merged["retry_limit"] = coerce_int(merged.get("retry_limit"), DEFAULT_PROFILE["retry_limit"], minimum=1)
         merged["timeout_seconds"] = coerce_int(merged.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-        merged["segment_time"] = effective_segment_time(merged)
+        merged["source_cache_segment_time"] = effective_source_cache_segment_time(merged)
+        merged["segment_time"] = effective_output_segment_time(merged)
         merged["playlist_size"] = coerce_int(merged.get("playlist_size"), DEFAULT_PROFILE["playlist_size"], minimum=3)
         merged["hls_segment_type"] = hls_segment_type(merged)
         merged["local_cache_enabled"] = parse_bool(merged.get("local_cache_enabled", DEFAULT_PROFILE["local_cache_enabled"]))
@@ -1369,6 +1405,7 @@ class LiveManager:
             self.status["last_segment_at"] = None
             self.status["last_snapshot_at"] = None
             self.status["last_ocr_results"] = {kind: None for kind in SNAPSHOT_KINDS}
+            self.status["last_valid_ocr_results"] = {kind: None for kind in SNAPSHOT_KINDS}
             self.status["auto_align_state"] = "idle"
             self.status["auto_align_monitor"] = {}
         self.log("cleared stream pipeline runtime")
@@ -1745,16 +1782,67 @@ class LiveManager:
         return self._max_hls_segment_number() + 1
 
     def _wait_for_playlist(self, playlist, proc, timeout, label):
+        playlist = Path(playlist)
         deadline = time.time() + timeout
         while time.time() < deadline and not self.stop_event.is_set():
             if playlist.exists():
                 return
-            if proc.poll() is not None:
+            if proc is not None and proc.poll() is not None:
                 raise RuntimeError(f"{label} exited with code {proc.returncode}")
             time.sleep(0.2)
         if self.stop_event.is_set():
             raise RuntimeError("stopped")
         raise RuntimeError(f"{label} playlist was not created")
+
+    def _playlist_ready_segments(self, playlist):
+        playlist = Path(playlist)
+        segments = self._playlist_segments(playlist)
+        return [seg for seg in segments if (playlist.parent / seg).exists()]
+
+    def _wait_for_delay_segments(self, recorder, playlist, required_segments, timeout, stage):
+        self._wait_for_playlist(playlist, recorder, timeout, stage)
+        needed = max(1, int(required_segments or 1))
+        deadline = time.time() + max(45, timeout * 2, needed * 2)
+        while time.time() < deadline and not self.stop_event.is_set():
+            ready = self._playlist_ready_segments(playlist)
+            if len(ready) >= needed:
+                return
+            if recorder is not None and recorder.poll() is not None:
+                raise RuntimeError(f"{stage} exited with code {recorder.returncode}")
+            time.sleep(0.5)
+        if self.stop_event.is_set():
+            raise RuntimeError("stopped")
+        raise RuntimeError(f"{stage} did not accumulate {needed} segments")
+
+    def _wait_for_local_cache_mux_plan(self, source_cache, offset, timeout, stage):
+        if not source_cache or not source_cache.video or not source_cache.audio:
+            raise RuntimeError("source cache unavailable: shared local HLS mux anchor requires both video and audio cache playlists")
+        if not source_cache.video.url or not source_cache.audio.url:
+            raise RuntimeError("source cache unavailable: shared local HLS mux anchor requires both video and audio cache playlists")
+        deadline = time.time() + max(45, timeout * 2)
+        video_offset = max(0.0, float(offset or 0.0))
+        audio_offset = max(0.0, -float(offset or 0.0))
+        with self.lock:
+            self.status["stage"] = stage
+        while time.time() < deadline and not self.stop_event.is_set():
+            for kind, proc in (("video", source_cache.video_proc), ("audio", source_cache.audio_proc)):
+                if proc is not None and proc.poll() is not None:
+                    raise RuntimeError(f"buffering cached {kind} exited with code {proc.returncode}")
+            try:
+                plan = self._shared_local_hls_mux_plan(
+                    source_cache.video.url,
+                    source_cache.audio.url,
+                    video_offset=video_offset,
+                    audio_offset=audio_offset,
+                )
+            except (FileNotFoundError, RuntimeError):
+                plan = None
+            if plan:
+                return plan
+            time.sleep(0.5)
+        if self.stop_event.is_set():
+            raise RuntimeError("stopped")
+        raise RuntimeError(f"{stage} timed out waiting for shared local HLS anchor")
 
     def _is_http_input(self, url):
         return str(url or "").lower().startswith(("http://", "https://"))
@@ -1786,6 +1874,45 @@ class LiveManager:
 
     def _local_input_args(self, url):
         return ["-i", url]
+
+    def _cache_source_input_args(self, url, timeout, headers=None):
+        text = str(url or "").strip()
+        if not self._is_http_input(text):
+            if text.lower().endswith(".m3u8"):
+                return self._latest_hls_input_args(text)
+            return self._local_input_args(text)
+        timeout = coerce_int(timeout, DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        is_hls = text.lower().endswith(".m3u8")
+        args = [
+            "-rw_timeout", str(timeout * 1_000_000),
+            *self._http_input_options(text, headers),
+        ]
+        # HLS playlists are short HTTP responses by design; reconnect-at-EOF
+        # makes ffmpeg loop on the playlist fetch itself and prevents segment
+        # loading. Reserve reconnect flags for streamed non-HLS HTTP inputs.
+        if not is_hls:
+            args += [
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                "-reconnect_on_http_error", "4xx,5xx",
+                "-reconnect_delay_max", "5",
+            ]
+        if is_hls:
+            args += ["-live_start_index", "-1"]
+        args += ["-i", text]
+        return args
+
+    def _hls_live_input_args(self, url, live_start_index=None):
+        args = []
+        if live_start_index is not None:
+            args += ["-live_start_index", str(int(live_start_index))]
+        args += ["-i", str(url)]
+        return args
+
+    def _latest_hls_input_args(self, url):
+        return self._hls_live_input_args(url, -1)
 
     def _stable_input_args(self, url, timeout, headers=None):
         if self._is_http_input(url):
@@ -1887,7 +2014,7 @@ class LiveManager:
         return False
 
     def _start_local_cache_recorder(self, channel, playlist, profile, kind, audio_stream_index=0):
-        segment = f"{effective_segment_time(profile):.3f}"
+        segment = f"{effective_source_cache_segment_time(profile):.3f}"
         list_size = local_cache_list_size(profile)
         segment_name = playlist.parent / f"{kind}_cache_%06d.ts"
         # Keep a video stream in the audio cache so OCR/snapshot jobs can read
@@ -1897,11 +2024,23 @@ class LiveManager:
         header_label = f", headers={','.join(channel.headers.keys())}" if channel.headers else ""
         context = (
             f"source={kind} url={channel.url}{header_label}; "
-            f"cache={playlist.name}; seconds={effective_local_cache_seconds(profile)}; copy"
+            f"cache={playlist.name}; segment={segment}s; seconds={effective_local_cache_seconds(profile)}; copy"
         )
+        timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
+        source_input = self._cache_source_input_args(
+            channel.url,
+            timeout,
+            channel.headers,
+        )
+        source_context_parts = []
+        if self._is_http_input(channel.url) and not str(channel.url or "").strip().lower().endswith(".m3u8"):
+            source_context_parts.append("reconnect=1")
+        if str(channel.url or "").strip().lower().endswith(".m3u8"):
+            source_context_parts.append("live_start_index=-1")
+        source_context = f"; {'; '.join(source_context_parts)}" if source_context_parts else ""
         return self._start_process([
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-            *self._stable_input_args(channel.url, profile.get("timeout_seconds"), channel.headers),
+            *source_input,
             *map_args,
             *self._video_copy_args(video_codec),
             "-c:a", "copy",
@@ -1910,11 +2049,11 @@ class LiveManager:
             "-hls_flags", "delete_segments+omit_endlist+append_list+program_date_time",
             "-hls_segment_filename", str(segment_name),
             str(playlist),
-        ], f"{kind}-cache", context=context)
+        ], f"{kind}-cache", context=f"{context}{source_context}")
 
     def _start_local_source_cache(self, video, audio, profile):
         cache_dir = WORK_DIR / "source_cache"
-        wait_timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5) + int(effective_segment_time(profile)) + 5
+        wait_timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5) + int(effective_source_cache_segment_time(profile)) + 5
         last_exc = None
         for attempt in range(2):
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -1959,7 +2098,7 @@ class LiveManager:
             raise last_exc
         raise RuntimeError("local cache warmup failed")
 
-    def _start_delay_recorder(self, channel, playlist, segment, list_size, timeout, kind, video_codec="", audio_stream_index=0):
+    def _start_delay_recorder(self, channel, playlist, segment, list_size, timeout, kind, video_codec="", audio_stream_index=0, input_args=None, realtime=False, source_label=""):
         url = channel.url
         segment_name = playlist.parent / f"{kind}_%06d.ts"
         if kind == "video":
@@ -1969,13 +2108,18 @@ class LiveManager:
             # can still read frames from the commentary source during re-alignment.
             stream_args = ["-map", "0:v:0?", "-map", f"0:a:{int(audio_stream_index)}?", "-c", "copy"]
         header_label = f", headers={','.join(channel.headers.keys())}" if channel.headers else ""
-        context = f"source={kind} url={url}{header_label}; output={playlist.name}"
+        context = f"source={kind} url={source_label or url}{header_label}; output={playlist.name}"
+        source_args = list(input_args) if input_args else list(self._stable_input_args(url, timeout, channel.headers))
+        if realtime:
+            source_args = ["-readrate", "1", *source_args]
         return self._start_process([
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-            *self._stable_input_args(url, timeout, channel.headers),
+            *source_args,
             *stream_args,
+            "-avoid_negative_ts", "make_zero",
             "-f", "hls", "-hls_time", segment, "-hls_list_size", str(list_size),
-            "-hls_flags", "delete_segments+omit_endlist+append_list",
+            "-hls_delete_threshold", "2",
+            "-hls_flags", "delete_segments+omit_endlist+append_list+program_date_time",
             "-hls_segment_filename", str(segment_name),
             str(playlist),
         ], f"{kind}-delay", context=context)
@@ -2037,9 +2181,10 @@ class LiveManager:
 
         offset = float(profile.get("offset_seconds") or 0)
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
-        segment_seconds = effective_segment_time(profile)
+        segment_seconds = effective_source_cache_segment_time(profile)
         segment = f"{segment_seconds:.3f}"
         delay_procs = []
+        large_delay = abs(offset) >= segment_seconds
         video_codec = self._probe_video_codec(video, timeout)
         audio_stream_index, audio_codec = self._select_audio_stream(audio, timeout) if audio_url else (0, "")
         channel_text = " ".join([
@@ -2082,12 +2227,71 @@ class LiveManager:
         audio_snapshot_input = list(video_input if single_input_av else audio_input)
         snapshot_jobs = []
         audio_copy_bsf = ""
+        video_live_start_index = None
+        audio_live_start_index = None
+        video_seek_seconds = 0.0
+        audio_seek_seconds = 0.0
 
         try:
             if 0.5 <= offset < segment_seconds:
                 video_input = self._offset_input_args(video_input, offset)
                 video_input_label = f"input0={source_kind} video ({video_url}{video_header_label}, offset +{offset:.3f}s via itsoffset)"
                 video_snapshot_input = list(video_input)
+            elif large_delay and source_cache and source_cache.video and source_cache.video.url and audio_url and source_cache.audio and source_cache.audio.url:
+                mux_plan = self._wait_for_local_cache_mux_plan(source_cache, offset, timeout, "buffering cached mux anchor")
+                video_live_start_index = mux_plan["video_live_start_index"]
+                audio_live_start_index = mux_plan["audio_live_start_index"]
+                anchor_time = float(mux_plan["anchor_time"])
+                video_target = float(mux_plan["video_target"])
+                audio_target = float(mux_plan["audio_target"])
+                relay_list_size = max(20, int(math.ceil(12.0 / max(segment_seconds, 0.5))) + 8)
+                video_delay_playlist = run_dir / "video_delay.m3u8"
+                audio_delay_playlist = run_dir / "audio_delay.m3u8"
+
+                video_relay = self._start_delay_recorder(
+                    source_cache.video,
+                    video_delay_playlist,
+                    segment,
+                    relay_list_size,
+                    timeout,
+                    "video",
+                    video_codec,
+                    input_args=self._hls_live_input_args(source_cache.video.url, video_live_start_index),
+                    realtime=True,
+                    source_label=f"{Path(source_cache.video.url).name} live_start_index={video_live_start_index}",
+                )
+                audio_relay = self._start_delay_recorder(
+                    source_cache.audio,
+                    audio_delay_playlist,
+                    segment,
+                    relay_list_size,
+                    timeout,
+                    "audio",
+                    audio_stream_index=0,
+                    input_args=self._hls_live_input_args(source_cache.audio.url, audio_live_start_index),
+                    realtime=True,
+                    source_label=f"{Path(source_cache.audio.url).name} live_start_index={audio_live_start_index}",
+                )
+                delay_procs.extend([video_relay, audio_relay])
+                self._wait_for_delay_segments(video_relay, video_delay_playlist, 4, timeout, "buffering cached video relay")
+                self._wait_for_delay_segments(audio_relay, audio_delay_playlist, 4, timeout, "buffering cached audio relay")
+
+                video_input = self._hls_live_input_args(video_delay_playlist, -3)
+                video_snapshot_input = list(video_input)
+                video_input_label = (
+                    f"input0=local video delay HLS ({video_delay_playlist.name}, source={Path(source_cache.video.url).name}, "
+                    f"source_live_start_index={video_live_start_index}, anchor={anchor_time:.3f}, target={video_target:.3f}, "
+                    f"offset {offset:+.3f}s)"
+                )
+
+                audio_input = self._hls_live_input_args(audio_delay_playlist, -3)
+                audio_map = "1:a:0"
+                audio_snapshot_input = list(audio_input)
+                audio_input_label = (
+                    f"input1=local audio delay HLS ({audio_delay_playlist.name}, source={Path(source_cache.audio.url).name}, "
+                    f"source_live_start_index={audio_live_start_index}, anchor={anchor_time:.3f}, target={audio_target:.3f}, "
+                    f"offset {offset:+.3f}s)"
+                )
             elif offset >= segment_seconds:
                 delay_playlist = run_dir / "video_delay.m3u8"
                 list_size = max(20, int(offset / segment_seconds) + 20)
@@ -2153,6 +2357,10 @@ class LiveManager:
             channel_prefers_fmp4=channel_prefers_fmp4,
             video_input_label=video_input_label,
             audio_input_label=audio_input_label,
+            video_live_start_index=video_live_start_index,
+            audio_live_start_index=audio_live_start_index,
+            video_seek_seconds=video_seek_seconds,
+            audio_seek_seconds=audio_seek_seconds,
             video_snapshot_input=video_snapshot_input,
             audio_snapshot_input=audio_snapshot_input,
             snapshot_jobs=snapshot_jobs,
@@ -2163,7 +2371,7 @@ class LiveManager:
         return self._next_hls_start_number() + max(1000, playlist_size * 4)
 
     def _start_mux(self, prepared, profile, *, append=False, start_number=None, playlist_path=None, discontinuity=False):
-        segment = f"{effective_segment_time(profile):.3f}"
+        segment = f"{effective_output_segment_time(profile):.3f}"
         playlist_size = coerce_int(profile.get("playlist_size"), DEFAULT_PROFILE["playlist_size"], minimum=3)
         segment_ext = effective_hls_segment_ext(profile, prepared)
         segment_type = effective_hls_segment_type(profile, prepared)
@@ -2467,6 +2675,119 @@ class LiveManager:
         self._save_alignment_pair_snapshots(video_frame, audio_frame, profile, video_sample, audio_sample, stage="candidate")
         return video_sample, audio_sample
 
+    def _capture_alignment_probe_bundle(self, video, audio, profile, tmpdir, timeout):
+        current_offset = float(profile.get("offset_seconds", 0) or 0.0)
+        preview_video_offset = max(0.0, current_offset)
+        preview_audio_offset = max(0.0, -current_offset)
+
+        cache_plan = self._shared_local_hls_capture_plan(
+            video.url,
+            audio.url,
+            video_offset=0.0,
+            audio_offset=0.0,
+        )
+        if not cache_plan:
+            raise RuntimeError("source cache unavailable: no shared stable local HLS anchor")
+        preview_plan = self._shared_local_hls_capture_plan(
+            video.url,
+            audio.url,
+            video_offset=preview_video_offset,
+            audio_offset=preview_audio_offset,
+        ) or cache_plan
+
+        cache_video_cap, cache_audio_cap = self._capture_frame_pair_to_targets(
+            video,
+            audio,
+            Path(tmpdir) / "cache",
+            timeout,
+            video_target=cache_plan["video_target"],
+            audio_target=cache_plan["audio_target"],
+            anchor_time=cache_plan["anchor_time"],
+            video_seconds_back=cache_plan["video_seconds_back"],
+            audio_seconds_back=cache_plan["audio_seconds_back"],
+        )
+        preview_video_cap, preview_audio_cap = self._capture_frame_pair_to_targets(
+            video,
+            audio,
+            Path(tmpdir) / "preview",
+            timeout,
+            video_target=preview_plan["video_target"],
+            audio_target=preview_plan["audio_target"],
+            anchor_time=preview_plan["anchor_time"],
+            video_seconds_back=preview_plan["video_seconds_back"],
+            audio_seconds_back=preview_plan["audio_seconds_back"],
+        )
+
+        frames = {
+            "cache_video": (cache_video_cap.path, f"{video.name} 缓存前"),
+            "cache_audio": (cache_audio_cap.path, f"{audio.name} 缓存前"),
+            "video": (preview_video_cap.path, f"{video.name} 预览"),
+            "audio": (preview_audio_cap.path, f"{audio.name} 预览"),
+        }
+        captures = {
+            "cache_video": cache_video_cap,
+            "cache_audio": cache_audio_cap,
+            "video": preview_video_cap,
+            "audio": preview_audio_cap,
+        }
+        return frames, captures
+
+    def _save_alignment_probe_bundle(self, frames, captures, profile, *, stage):
+        cache_video = captures.get("cache_video")
+        cache_audio = captures.get("cache_audio")
+        preview_video = captures.get("video")
+        preview_audio = captures.get("audio")
+
+        video_sample = self._read_top_quarter_clock(cache_video.path) if cache_video else None
+        audio_sample = self._read_top_quarter_clock(cache_audio.path) if cache_audio else None
+
+        if stage == "candidate":
+            if cache_video:
+                self._write_probe_raw_snapshot_file(cache_video.path, "cache_video", stage)
+            if cache_audio:
+                self._write_probe_raw_snapshot_file(cache_audio.path, "cache_audio", stage)
+
+        if cache_video:
+            self._save_probe_snapshot_result(
+                cache_video.path,
+                "cache_video",
+                profile,
+                video_sample,
+                f"auto-align {stage} cache video",
+            )
+        if cache_audio:
+            self._save_probe_snapshot_result(
+                cache_audio.path,
+                "cache_audio",
+                profile,
+                audio_sample,
+                f"auto-align {stage} cache audio",
+            )
+
+        if preview_video:
+            self._save_snapshot_without_ocr(
+                preview_video.path,
+                "video",
+                profile,
+                frames["video"][1],
+                suffix=f"auto-align {stage} preview video",
+            )
+        if preview_audio:
+            self._save_snapshot_without_ocr(
+                preview_audio.path,
+                "audio",
+                profile,
+                frames["audio"][1],
+                suffix=f"auto-align {stage} preview audio",
+            )
+
+        with self.lock:
+            if isinstance(self.status.get("last_ocr_results"), dict):
+                self.status["last_ocr_results"]["video"] = None
+                self.status["last_ocr_results"]["audio"] = None
+
+        return video_sample, audio_sample
+
     def auto_align_collect_probe_readings(self, video, audio, profile, sample_count, timeout, spacing_seconds, *, stage):
         readings = []
         last_error = ""
@@ -2489,6 +2810,37 @@ class LiveManager:
             for idx in range(max(1, int(sample_count or 1))):
                 if idx > 0:
                     time.sleep(max(0.0, float(spacing_seconds or 0.0)))
+                if stage == "candidate":
+                    try:
+                        bundle_frames, bundle_captures = self._capture_alignment_probe_bundle(
+                            video,
+                            audio,
+                            profile,
+                            tmpdir / f"sample_{idx:02d}",
+                            timeout,
+                        )
+                    except Exception as exc:
+                        last_error = str(exc).strip()
+                        continue
+                    cache_video = bundle_captures.get("cache_video")
+                    cache_audio = bundle_captures.get("cache_audio")
+                    if not cache_video or not cache_audio:
+                        last_error = "probe capture failed"
+                        continue
+                    if (
+                        self._pair_capture_skew(cache_video, cache_audio) > ALIGN_MAX_CAPTURE_SKEW_SECONDS
+                        or self._pair_capture_finish_delta(cache_video, cache_audio) > ALIGN_MAX_FINISH_DELTA_SECONDS
+                    ):
+                        last_error = "capture skew too large: video/audio frame timestamps differ too much"
+                        continue
+                    with self.lock:
+                        monitor = self.status.get("auto_align_monitor")
+                        if isinstance(monitor, dict):
+                            monitor["candidate_video_seconds_back"] = float(cache_video.seconds_back or 0.0)
+                            monitor["candidate_audio_seconds_back"] = float(cache_audio.seconds_back or 0.0)
+                    video_sample, audio_sample = self._save_alignment_probe_bundle(bundle_frames, bundle_captures, profile, stage=stage)
+                    readings.append((video_sample, audio_sample))
+                    continue
                 try:
                     video_cap, audio_cap = self._capture_frame_pair(
                         video,
@@ -2560,11 +2912,27 @@ class LiveManager:
     def _current_auto_align_source_cache(self):
         return self._auto_align_source_cache
 
+    def _current_snapshot_job_map(self):
+        with self.lock:
+            jobs = list(self.current_snapshot_jobs)
+        return {
+            kind: (list(input_args), source_name)
+            for kind, input_args, source_name in jobs
+            if input_args
+        }
+
     def _offset_input_args(self, input_args, offset_seconds):
         offset = float(offset_seconds or 0.0)
         if offset <= 0:
             return list(input_args)
         return ["-itsoffset", f"{offset:.3f}", *list(input_args)]
+
+    def _keyframe_only_input_args(self, input_args):
+        args = list(input_args or [])
+        for idx, arg in enumerate(args):
+            if arg == "-i":
+                return [*args[:idx], "-skip_frame", "nokey", *args[idx:]]
+        return ["-skip_frame", "nokey", *args]
 
     def _input_has_video_stream(self, url, timeout, headers=None):
         text = str(url or "").strip()
@@ -2600,10 +2968,10 @@ class LiveManager:
         try:
             subprocess.run([
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                *self._offset_input_args(
+                *self._keyframe_only_input_args(self._offset_input_args(
                     self._fast_input_args(url, timeout, headers),
                     offset_seconds,
-                ),
+                )),
                 "-frames:v", "1", "-update", "1", str(out_path),
             ], capture_output=True, text=True, timeout=timeout + 5, check=True)
         except Exception as exc:
@@ -2620,52 +2988,40 @@ class LiveManager:
         deadline_ns,
         offset_seconds=0.0,
         *,
-        force_live_edge=False,
+        target_time=None,
         media_time=0.0,
         anchor_time=0.0,
+        seconds_back=0.0,
     ):
         barrier.wait()
         now_ns = time.monotonic_ns()
         if deadline_ns and now_ns < deadline_ns:
             time.sleep((deadline_ns - now_ns) / 1_000_000_000)
         started_at = time.monotonic()
-        if force_live_edge or float(offset_seconds or 0.0) > 0:
-            self._extract_frame_from_live_edge(url, offset_seconds, out_path, timeout, headers)
+        target_time = float(target_time or 0.0)
+        if target_time > 0 and str(url or "").strip().endswith(".m3u8") and not self._is_http_input(url):
+            self._extract_frame_from_local_hls_target(url, target_time, out_path, timeout, headers)
         else:
-            self._extract_current_frame(url, out_path, timeout, headers, offset_seconds=0.0)
+            self._extract_current_frame(url, out_path, timeout, headers, offset_seconds=max(0.0, float(offset_seconds or 0.0)))
         finished_at = time.monotonic()
         return FrameCaptureResult(
             Path(out_path),
             kind,
             started_at,
             finished_at,
-            media_time=float(media_time or 0.0),
+            media_time=target_time if target_time > 0 else float(media_time or 0.0),
             source=kind,
             anchor_time=float(anchor_time or 0.0),
-            seconds_back=float(offset_seconds or 0.0),
+            seconds_back=float(seconds_back or 0.0),
         )
 
-    def _capture_frame_pair(self, video, audio, tmpdir, timeout, *, deadline_delay=1.25, video_offset=0.0, audio_offset=0.0):
+    def _capture_frame_pair_to_targets(self, video, audio, tmpdir, timeout, *, video_target, audio_target, anchor_time, video_seconds_back=0.0, audio_seconds_back=0.0, deadline_delay=1.25):
         tmpdir = Path(tmpdir)
         tmpdir.mkdir(parents=True, exist_ok=True)
         video_frame = tmpdir / "align_video.jpg"
         audio_frame = tmpdir / "align_audio.jpg"
         barrier = threading.Barrier(2)
         deadline_ns = time.monotonic_ns() + int(max(0.0, deadline_delay) * 1_000_000_000)
-        capture_plan = self._shared_local_hls_capture_plan(
-            video.url,
-            audio.url,
-            video_offset=video_offset,
-            audio_offset=audio_offset,
-        )
-        if not capture_plan:
-            raise RuntimeError("source cache unavailable: no shared stable local HLS anchor")
-        force_live_edge = True
-        shared_anchor_time = capture_plan["anchor_time"] if capture_plan else 0.0
-        video_capture_offset = capture_plan["video_seconds_back"] if capture_plan else video_offset
-        audio_capture_offset = capture_plan["audio_seconds_back"] if capture_plan else audio_offset
-        video_media_time = capture_plan["video_target"] if capture_plan else 0.0
-        audio_media_time = capture_plan["audio_target"] if capture_plan else 0.0
         with ThreadPoolExecutor(max_workers=2) as pool:
             futs = [
                 pool.submit(
@@ -2677,10 +3033,11 @@ class LiveManager:
                     video.headers,
                     barrier,
                     deadline_ns,
-                    video_capture_offset,
-                    force_live_edge=force_live_edge,
-                    media_time=video_media_time,
-                    anchor_time=shared_anchor_time,
+                    0.0,
+                    target_time=float(video_target),
+                    media_time=float(video_target),
+                    anchor_time=float(anchor_time),
+                    seconds_back=float(video_seconds_back or 0.0),
                 ),
                 pool.submit(
                     self._capture_frame_at_deadline,
@@ -2691,10 +3048,68 @@ class LiveManager:
                     audio.headers,
                     barrier,
                     deadline_ns,
-                    audio_capture_offset,
-                    force_live_edge=force_live_edge,
-                    media_time=audio_media_time,
-                    anchor_time=shared_anchor_time,
+                    0.0,
+                    target_time=float(audio_target),
+                    media_time=float(audio_target),
+                    anchor_time=float(anchor_time),
+                    seconds_back=float(audio_seconds_back or 0.0),
+                ),
+            ]
+            results = []
+            for fut in as_completed(futs):
+                results.append(fut.result())
+        by_kind = {item.kind: item for item in results}
+        return by_kind["video"], by_kind["audio"]
+
+    def _capture_frame_pair(self, video, audio, tmpdir, timeout, *, deadline_delay=1.25, video_offset=0.0, audio_offset=0.0):
+        capture_plan = self._shared_local_hls_capture_plan(
+            video.url,
+            audio.url,
+            video_offset=video_offset,
+            audio_offset=audio_offset,
+        )
+        if capture_plan:
+            return self._capture_frame_pair_to_targets(
+                video,
+                audio,
+                tmpdir,
+                timeout,
+                video_target=capture_plan["video_target"],
+                audio_target=capture_plan["audio_target"],
+                anchor_time=capture_plan["anchor_time"],
+                video_seconds_back=capture_plan["video_seconds_back"],
+                audio_seconds_back=capture_plan["audio_seconds_back"],
+                deadline_delay=deadline_delay,
+            )
+        tmpdir = Path(tmpdir)
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        video_frame = tmpdir / "align_video.jpg"
+        audio_frame = tmpdir / "align_audio.jpg"
+        barrier = threading.Barrier(2)
+        deadline_ns = time.monotonic_ns() + int(max(0.0, deadline_delay) * 1_000_000_000)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = [
+                pool.submit(
+                    self._capture_frame_at_deadline,
+                    "video",
+                    video.url,
+                    video_frame,
+                    timeout,
+                    video.headers,
+                    barrier,
+                    deadline_ns,
+                    video_offset,
+                ),
+                pool.submit(
+                    self._capture_frame_at_deadline,
+                    "audio",
+                    audio.url,
+                    audio_frame,
+                    timeout,
+                    audio.headers,
+                    barrier,
+                    deadline_ns,
+                    audio_offset,
                 ),
             ]
             results = []
@@ -2818,6 +3233,46 @@ class LiveManager:
             return None
         return PlaylistProgramWindow(start_time, end_time, segment_count)
 
+    def _playlist_program_segments(self, playlist_path):
+        playlist = Path(playlist_path or "")
+        try:
+            lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            return []
+        cursor_ts = None
+        pending_duration = None
+        pending_pdt = None
+        segments = []
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                pending_pdt = self._parse_program_date_time(line.split(":", 1)[1])
+                continue
+            match = HLS_EXTINF_RE.match(line)
+            if match:
+                try:
+                    pending_duration = float(match.group(1))
+                except (TypeError, ValueError):
+                    pending_duration = None
+                continue
+            if line.startswith("#"):
+                continue
+            if pending_pdt is not None:
+                cursor_ts = pending_pdt
+            if pending_duration is None or cursor_ts is None:
+                pending_duration = None
+                pending_pdt = None
+                continue
+            segment_start = cursor_ts
+            segment_end = cursor_ts + pending_duration
+            segments.append(PlaylistProgramSegment(segment_start, segment_end, pending_duration))
+            cursor_ts = segment_end
+            pending_duration = None
+            pending_pdt = None
+        return segments
+
     def _shared_local_hls_capture_plan(self, video_url, audio_url, *, video_offset=0.0, audio_offset=0.0):
         video_text = str(video_url or "").strip()
         audio_text = str(audio_url or "").strip()
@@ -2851,34 +3306,63 @@ class LiveManager:
             "audio_seconds_back": audio_seconds_back,
         }
 
-    def _local_hls_seek_plan(self, playlist_path, seconds_back):
-        durations = self._playlist_segment_durations(playlist_path)
-        if not durations:
-            raise RuntimeError(f"playlist has no duration: {Path(playlist_path).name}")
-        total_duration = sum(durations)
-        target_time = max(0.0, total_duration - max(0.0, float(seconds_back or 0.0)))
-        if target_time <= 0:
-            return 0, 0.0
+    def _playlist_segment_index_for_time(self, playlist_path, target_time):
+        segments = self._playlist_program_segments(playlist_path)
+        if not segments:
+            raise RuntimeError(f"playlist has no program timeline: {Path(playlist_path).name}")
+        target_time = float(target_time)
+        if target_time < segments[0].start_time or target_time >= segments[-1].end_time:
+            raise RuntimeError(f"target time outside playlist window: {Path(playlist_path).name}")
 
-        starts = []
-        elapsed = 0.0
-        for duration in durations:
-            starts.append(elapsed)
-            elapsed += duration
-
-        start_index = max(0, len(durations) - 1)
-        for idx, segment_start in enumerate(starts):
-            if target_time < segment_start + durations[idx]:
-                start_index = idx
+        target_index = max(0, len(segments) - 1)
+        for idx, segment in enumerate(segments):
+            if segment.start_time <= target_time < segment.end_time:
+                target_index = idx
                 break
+        return segments, target_index
 
-        # Keep ffmpeg's post-input seek short; larger seeks on the rolling 4K
-        # local cache reproduce the 20s verify timeout seen in production.
+    def _local_hls_live_start_index_for_time(self, playlist_path, target_time):
+        segments, target_index = self._playlist_segment_index_for_time(playlist_path, target_time)
+        return target_index - len(segments), target_index, len(segments)
+
+    def _shared_local_hls_mux_plan(self, video_url, audio_url, *, video_offset=0.0, audio_offset=0.0):
+        capture_plan = self._shared_local_hls_capture_plan(
+            video_url,
+            audio_url,
+            video_offset=video_offset,
+            audio_offset=audio_offset,
+        )
+        if not capture_plan:
+            return None
+
+        video_live_start_index, video_segment_index, video_segment_count = self._local_hls_live_start_index_for_time(
+            video_url,
+            capture_plan["video_target"],
+        )
+        audio_live_start_index, audio_segment_index, audio_segment_count = self._local_hls_live_start_index_for_time(
+            audio_url,
+            capture_plan["audio_target"],
+        )
+        return {
+            **capture_plan,
+            "video_live_start_index": video_live_start_index,
+            "audio_live_start_index": audio_live_start_index,
+            "video_segment_index": video_segment_index,
+            "audio_segment_index": audio_segment_index,
+            "video_segment_count": video_segment_count,
+            "audio_segment_count": audio_segment_count,
+            "video_seek_seconds": 0.0,
+            "audio_seek_seconds": 0.0,
+        }
+
+    def _local_hls_seek_plan(self, playlist_path, target_time):
+        segments, start_index = self._playlist_segment_index_for_time(playlist_path, target_time)
+
         max_local_seek = 6.0
-        while start_index > 0 and (target_time - starts[start_index - 1]) <= max_local_seek:
+        while start_index > 0 and (target_time - segments[start_index - 1].start_time) <= max_local_seek:
             start_index -= 1
 
-        seek_seconds = max(0.0, target_time - starts[start_index])
+        seek_seconds = max(0.0, target_time - segments[start_index].start_time)
         return start_index, seek_seconds
 
     def _build_local_hls_capture_playlist(self, playlist_path, start_index):
@@ -2915,16 +3399,17 @@ class LiveManager:
             if line.startswith("#"):
                 pending_lines.append(line)
                 continue
-            segment_blocks.append([*pending_lines, line])
+            segment_uri = line
+            if not str(segment_uri).startswith(("http://", "https://", "/")):
+                segment_uri = str((playlist.parent / segment_uri).resolve())
+            segment_blocks.append([*pending_lines, segment_uri])
             pending_lines = []
 
         if not segment_blocks:
             raise RuntimeError(f"playlist has no segments: {playlist.name}")
 
         start_index = max(0, min(int(start_index), len(segment_blocks) - 1))
-        output_lines = []
-        if not header_lines or header_lines[0] != "#EXTM3U":
-            output_lines.append("#EXTM3U")
+        output_lines = ["#EXTM3U"]
         output_lines.extend(line for line in header_lines if line != "#EXTM3U")
         output_lines.append(f"#EXT-X-MEDIA-SEQUENCE:{media_sequence + start_index}")
         for block in segment_blocks[start_index:]:
@@ -2935,30 +3420,27 @@ class LiveManager:
         tmp_playlist.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
         return tmp_playlist
 
-    def _extract_frame_from_live_edge(self, url, seconds_back, out_path, timeout, headers=None):
+    def _extract_frame_from_local_hls_target(self, url, target_time, out_path, timeout, headers=None):
         timeout = min(coerce_int(timeout, DEFAULT_PROFILE["timeout_seconds"], minimum=5), FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
-        seconds_back = max(0.0, float(seconds_back or 0.0))
-        text = str(url or "").strip()
-        is_http = text.startswith(("http://", "https://"))
-        if not is_http and text.endswith(".m3u8"):
-            playlist = Path(text)
-            if not playlist.exists():
-                raise FileNotFoundError(f"frame source missing: {text}")
-            start_index, at = self._local_hls_seek_plan(playlist, seconds_back)
-            tmp_playlist = self._build_local_hls_capture_playlist(playlist, start_index)
-            try:
-                subprocess.run([
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        playlist = Path(str(url or ""))
+        if not playlist.exists():
+            raise FileNotFoundError(f"frame source missing: {playlist}")
+        start_index, at = self._local_hls_seek_plan(playlist, target_time)
+        tmp_playlist = self._build_local_hls_capture_playlist(playlist, start_index)
+        try:
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                *self._keyframe_only_input_args([
+                    "-allowed_extensions", "ALL",
                     *self._fast_input_args(str(tmp_playlist), timeout, headers),
-                    "-ss", f"{at:.3f}",
-                    "-frames:v", "1", "-update", "1", str(out_path),
-                ], capture_output=True, text=True, timeout=timeout + 10, check=True)
-            except Exception as exc:
-                raise self._frame_capture_failure(text, timeout, headers, exc) from exc
-            finally:
-                tmp_playlist.unlink(missing_ok=True)
-            return
-        self._extract_current_frame(url, out_path, timeout, headers, offset_seconds=seconds_back)
+                ]),
+                "-ss", f"{at:.3f}",
+                "-frames:v", "1", "-update", "1", str(out_path),
+            ], capture_output=True, text=True, timeout=timeout + 10, check=True)
+        except Exception as exc:
+            raise self._frame_capture_failure(str(url), timeout, headers, exc) from exc
+        finally:
+            tmp_playlist.unlink(missing_ok=True)
 
     def _read_locked_clock(self, frame_path, roi, kind=None):
         if roi is None:
@@ -2977,12 +3459,37 @@ class LiveManager:
             return None
         result = ClockSample(0.0, parsed[0], parsed[1], roi, parsed[2] if len(parsed) > 2 else "", parsed[3] if len(parsed) > 3 else "")
         if kind:
+            valid, reason = self._validate_ocr_clock_sample(kind, result)
+            if not valid:
+                self._set_ocr_diagnostic(kind, provider=result.provider, note=result.note, error=f"ocr unstable: {reason}")
+                with self.lock:
+                    self.status.setdefault("last_ocr_results", {})[kind] = {
+                        "clock": result.text,
+                        "game_time": result.game_time,
+                        "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                        "updated_at_unix": time.time(),
+                        "error": "ocr unstable",
+                        "provider": result.provider,
+                        "note": result.note,
+                        "detail_error": reason,
+                    }
+                return None
             self._set_ocr_diagnostic(kind, provider=result.provider, note=result.note)
             with self.lock:
+                now_ts = time.time()
                 self.status.setdefault("last_ocr_results", {})[kind] = {
                     "clock": result.text,
                     "game_time": result.game_time,
                     "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                    "updated_at_unix": now_ts,
+                    "provider": result.provider,
+                    "note": result.note,
+                }
+                self.status.setdefault("last_valid_ocr_results", {})[kind] = {
+                    "clock": result.text,
+                    "game_time": result.game_time,
+                    "updated_at": time.strftime("%H:%M:%S", time.localtime()),
+                    "updated_at_unix": now_ts,
                     "provider": result.provider,
                     "note": result.note,
                 }
@@ -2990,6 +3497,36 @@ class LiveManager:
 
     def _read_top_quarter_clock(self, frame_path, kind=None):
         return self._read_locked_clock(frame_path, self._scoreboard_top_quarter_roi(), kind=kind)
+
+    def _validate_ocr_clock_sample(self, kind, sample):
+        if not kind or sample is None:
+            return True, ""
+        with self.lock:
+            last = dict((self.status.get("last_valid_ocr_results") or {}).get(kind) or {})
+        prev_game_time = last.get("game_time")
+        if prev_game_time is None:
+            return True, ""
+        try:
+            prev_game_time = int(prev_game_time)
+        except (TypeError, ValueError):
+            return True, ""
+        current_game_time = int(sample.game_time)
+        delta = current_game_time - prev_game_time
+        if delta < -2:
+            return False, f"clock moved backwards by {abs(delta)}s"
+        prev_updated_at = last.get("updated_at_unix")
+        try:
+            prev_updated_at = float(prev_updated_at or 0)
+        except (TypeError, ValueError):
+            prev_updated_at = 0.0
+        elapsed = max(0.0, time.time() - prev_updated_at) if prev_updated_at > 0 else None
+        if elapsed is None:
+            max_advance = 12.0
+        else:
+            max_advance = max(12.0, (elapsed * 1.5) + 5.0)
+        if delta > max_advance:
+            return False, f"clock jumped forward by {delta}s in {elapsed:.1f}s"
+        return True, ""
 
     def _scoreboard_top_quarter_roi(self):
         return (0.0, 0.0, 1.0, 0.25)
@@ -3122,7 +3659,7 @@ class LiveManager:
         timeout = coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5)
         stall_timeout = hls_stall_timeout(profile)
         startup_timeout = startup_hls_wait_timeout(profile)
-        segment_seconds = effective_segment_time(profile)
+        segment_seconds = effective_output_segment_time(profile)
         source_cache = None
         pipeline_video = video
         pipeline_audio = audio
@@ -4358,6 +4895,20 @@ class LiveManager:
             self._prune_snapshots()
             return out
 
+    def _write_probe_raw_snapshot_file(self, frame_path, kind, stage):
+        frame_path = Path(frame_path)
+        if not frame_path.exists():
+            return None
+        stage_text = re.sub(r"[^a-z0-9_-]+", "_", str(stage or "probe").lower())
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        with self.snapshot_file_lock:
+            SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            out = SNAPSHOT_DIR / f"{kind}_{stage_text}_raw_{ts}.jpg"
+            tmp_out = SNAPSHOT_DIR / f".{kind}_{stage_text}_raw_{ts}.tmp.jpg"
+            shutil.copyfile(frame_path, tmp_out)
+            os.replace(tmp_out, out)
+            return out
+
     def _save_snapshot_without_ocr(self, frame_path, kind, profile, source_name, *, suffix="manual"):
         roi = self._snapshot_roi_for_kind(profile, kind)
         out = self._write_snapshot_file(frame_path, kind, roi)
@@ -4372,7 +4923,9 @@ class LiveManager:
         suffix = "timer" if parsed else "full"
         if not parsed:
             suffix = "full"
-            self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
+            diagnostic = dict((self.status.get("last_ocr_diagnostic") or {}).get(kind) or {})
+            if not diagnostic.get("error"):
+                self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
         else:
             self._set_ocr_diagnostic(kind, provider=parsed[2] if len(parsed) > 2 else "", note=parsed[3] if len(parsed) > 3 else "")
         out = self._write_snapshot_file(frame_path, kind, roi)
@@ -4385,7 +4938,8 @@ class LiveManager:
                 "clock": parsed[1] if parsed else None,
                 "game_time": parsed[0] if parsed else None,
                 "updated_at": time.strftime("%H:%M:%S", time.localtime()),
-                "error": "" if parsed else "OCR failed",
+                "updated_at_unix": time.time(),
+                "error": "" if parsed else (diagnostic.get("error") or "OCR failed"),
                 "provider": diagnostic.get("provider", ""),
                 "note": diagnostic.get("note", ""),
                 "route": diagnostic.get("route", ""),
@@ -4405,7 +4959,9 @@ class LiveManager:
         if sample:
             self._set_ocr_diagnostic(kind, provider=sample.provider, note=sample.note)
         else:
-            self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
+            diagnostic = dict((self.status.get("last_ocr_diagnostic") or {}).get(kind) or {})
+            if not diagnostic.get("error"):
+                self._set_ocr_diagnostic(kind, error="remote OCR recognized no valid clock")
         diagnostic = {}
         with self.lock:
             diagnostic = dict((self.status.get("last_ocr_diagnostic") or {}).get(kind) or {})
@@ -4415,7 +4971,8 @@ class LiveManager:
                 "clock": sample.text if sample else None,
                 "game_time": sample.game_time if sample else None,
                 "updated_at": time.strftime("%H:%M:%S", time.localtime()),
-                "error": "" if sample else "OCR failed",
+                "updated_at_unix": time.time(),
+                "error": "" if sample else (diagnostic.get("error") or "OCR failed"),
                 "provider": diagnostic.get("provider", ""),
                 "note": diagnostic.get("note", ""),
                 "route": diagnostic.get("route", ""),
@@ -4431,6 +4988,8 @@ class LiveManager:
         if stage == "candidate":
             video_kind = "cache_video"
             audio_kind = "cache_audio"
+            self._write_probe_raw_snapshot_file(video_frame, video_kind, stage)
+            self._write_probe_raw_snapshot_file(audio_frame, audio_kind, stage)
         self._save_probe_snapshot_result(video_frame, video_kind, profile, video_sample, f"auto-align {stage} video")
         self._save_probe_snapshot_result(audio_frame, audio_kind, profile, audio_sample, f"auto-align {stage} audio")
 
@@ -4446,19 +5005,72 @@ class LiveManager:
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    def _capture_snapshot_frame(self, input_args, timeout):
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+    def _capture_snapshot_frame(self, input_args, timeout, out_path=None):
+        if out_path is None:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            created_tmp = True
+        else:
+            tmp_path = Path(out_path)
+            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+            created_tmp = False
         try:
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                *input_args, "-frames:v", "1", "-update", "1", str(tmp_path),
+                *self._keyframe_only_input_args(input_args), "-frames:v", "1", "-update", "1", str(tmp_path),
             ]
             subprocess.run(cmd, timeout=timeout + 5, check=True)
             return tmp_path
         except Exception:
             tmp_path.unlink(missing_ok=True)
+            if created_tmp:
+                tmp_path.unlink(missing_ok=True)
             raise
+
+    def _capture_snapshot_frame_at_deadline(self, kind, input_args, out_path, timeout, barrier, deadline_ns, source_name=""):
+        barrier.wait()
+        now_ns = time.monotonic_ns()
+        if deadline_ns and now_ns < deadline_ns:
+            time.sleep((deadline_ns - now_ns) / 1_000_000_000)
+        started_at = time.monotonic()
+        self._capture_snapshot_frame(input_args, timeout, out_path=out_path)
+        finished_at = time.monotonic()
+        return FrameCaptureResult(Path(out_path), kind, started_at, finished_at, source=source_name)
+
+    def _capture_snapshot_bundle(self, jobs, tmpdir, timeout, *, deadline_delay=1.25):
+        jobs = [(kind, list(input_args), source_name) for kind, input_args, source_name in jobs if input_args]
+        frames = {}
+        errors = {}
+        captures = {}
+        if not jobs:
+            return frames, {"snapshot": "no snapshot URLs available"}, captures
+        tmpdir = Path(tmpdir)
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        barrier = threading.Barrier(len(jobs))
+        deadline_ns = time.monotonic_ns() + int(max(0.0, float(deadline_delay or 0.0)) * 1_000_000_000)
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {
+                pool.submit(
+                    self._capture_snapshot_frame_at_deadline,
+                    kind,
+                    input_args,
+                    tmpdir / f"{kind}.jpg",
+                    timeout,
+                    barrier,
+                    deadline_ns,
+                    source_name,
+                ): (kind, source_name)
+                for kind, input_args, source_name in jobs
+            }
+            for fut in as_completed(futures):
+                kind, source_name = futures[fut]
+                try:
+                    capture = fut.result()
+                    captures[kind] = capture
+                    frames[kind] = (capture.path, source_name)
+                except Exception as exc:
+                    errors[kind] = str(exc)
+        return frames, errors, captures
 
     def _runtime_snapshot_jobs(self, video, audio, profile):
         with self.lock:
@@ -4512,12 +5124,14 @@ class LiveManager:
             frame_path.unlink(missing_ok=True)
 
     def _capture_snapshot_jobs(self, jobs, profile):
-        frames, errors = self._capture_snapshot_frames(jobs, profile)
-        try:
-            results, save_errors = self._save_snapshot_frames(frames, profile, run_ocr=False, suffix="manual")
-            errors.update(save_errors)
-        finally:
-            self._cleanup_snapshot_frames(frames)
+        timeout = min(coerce_int(profile.get("timeout_seconds"), DEFAULT_PROFILE["timeout_seconds"], minimum=5), FFMPEG_FAST_TIMEOUT_CAP_SECONDS)
+        with tempfile.TemporaryDirectory(prefix="snapshot_sync_") as tmp:
+            frames, errors, _captures = self._capture_snapshot_bundle(jobs, Path(tmp), timeout)
+            try:
+                results, save_errors = self._save_snapshot_frames(frames, profile, run_ocr=False, suffix="manual")
+                errors.update(save_errors)
+            finally:
+                self._cleanup_snapshot_frames(frames)
         return results, errors
 
     def _capture_runtime_snapshots_now(self, video, audio, profile):
@@ -4535,8 +5149,21 @@ class LiveManager:
     def _prune_snapshots(self):
         keep = {f"{kind}_snapshot.jpg" for kind in SNAPSHOT_KINDS}
         for item in SNAPSHOT_DIR.glob("*.jpg"):
+            if item.name in keep:
+                continue
+            if re.match(r"^(cache_video|cache_audio)_candidate_raw_\d{8}T\d{6}Z\.jpg$", item.name):
+                continue
             if item.name not in keep:
                 item.unlink(missing_ok=True)
+
+    def _latest_probe_raw_snapshot(self, kind, stage="candidate"):
+        stage_text = re.sub(r"[^a-z0-9_-]+", "_", str(stage or "probe").lower())
+        candidates = sorted(
+            SNAPSHOT_DIR.glob(f"{kind}_{stage_text}_raw_*.jpg"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
 
     def _resolve_snapshot_channel(self, kind, profile, force=True):
         if kind == "audio":
@@ -4774,7 +5401,7 @@ class LiveManager:
                 started_at_unix=time.time(),
                 source_playlist=f"/{playlist_source.name}",
                 source_segment_type=self._current_live_segment_type(),
-                segment_time=effective_segment_time(profile),
+                segment_time=effective_output_segment_time(profile),
                 playlist_path=str(self._recording_playlist_path(session_id)),
                 merge_status="not_requested",
             )
@@ -5025,7 +5652,24 @@ class Handler(SimpleHTTPRequestHandler):
                     shots.append({"kind": kind, "url": f"/snapshots/{p.name}", "name": p.name, "mtime": p.stat().st_mtime})
                 else:
                     shots.append({"kind": kind, "url": "", "name": f"{kind}_snapshot.jpg", "mtime": 0})
-            return self.send_json({"snapshots": shots})
+            candidate_raw = []
+            for kind in ("cache_video", "cache_audio"):
+                p = MANAGER._latest_probe_raw_snapshot(kind, "candidate")
+                if p and p.exists():
+                    candidate_raw.append({
+                        "kind": kind,
+                        "url": f"/snapshots/{p.name}",
+                        "name": p.name,
+                        "mtime": p.stat().st_mtime,
+                    })
+                else:
+                    candidate_raw.append({
+                        "kind": kind,
+                        "url": "",
+                        "name": f"{kind}_candidate_raw.jpg",
+                        "mtime": 0,
+                    })
+            return self.send_json({"snapshots": shots, "candidate_raw": candidate_raw})
         if path == "/emby.m3u":
             return self.send_text(self.emby_m3u(), "audio/x-mpegurl; charset=utf-8")
         if path == "/guide.xml":

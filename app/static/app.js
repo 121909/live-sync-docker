@@ -18,6 +18,7 @@ const profileFields = [
   "offset_seconds",
   "timeout_seconds",
   "retry_limit",
+  "source_cache_segment_time",
   "segment_time",
   "playlist_size",
   "channel_name",
@@ -180,7 +181,7 @@ function profileFromForm() {
         .split("\n")
         .map((item) => item.trim())
         .filter(Boolean);
-    } else if (["offset_seconds", "segment_time", "auto_align_threshold", "auto_align_max_offset"].includes(name)) {
+    } else if (["offset_seconds", "source_cache_segment_time", "segment_time", "auto_align_threshold", "auto_align_max_offset"].includes(name)) {
       profile[name] = Number(el.value || 0);
     } else if ([
       "timeout_seconds",
@@ -399,7 +400,6 @@ function renderOcrResults(status) {
   if (!root) return;
   root.innerHTML = "";
   const ocr = status.last_ocr_results || {};
-  const monitor = status.auto_align_monitor || {};
   const routeText = (route) => {
     if (route === "remote_request_failed -> rapidocr_local") return "primary/backup request failed -> rapidocr_local";
     if (route === "ocrspace") return "primary/backup resolved at ocrspace";
@@ -440,7 +440,6 @@ function renderOcrResults(status) {
   };
   const groups = [
     { title: "缓存截图", videoKind: "cache_video", audioKind: "cache_audio" },
-    { title: "验证截图", videoKind: "video", audioKind: "audio" },
   ];
   for (const group of groups) {
     const panel = document.createElement("div");
@@ -466,18 +465,13 @@ function renderOcrResults(status) {
       const routeEl = document.createElement("div");
       routeEl.className = "ocr-route";
       const data = ocr[entry.kind];
-      const monitorClock = entry.kind === "video" ? monitor.video_clock : entry.kind === "audio" ? monitor.audio_clock : "";
       if (data && data.clock) {
         clockEl.textContent = data.clock;
-        timeEl.textContent = formatOcrMeta(data, monitorClock);
-        routeEl.textContent = providerRouteLabel(data);
-      } else if (monitorClock) {
-        clockEl.textContent = monitorClock;
-        timeEl.textContent = formatOcrMeta(data, monitorClock);
+        timeEl.textContent = formatOcrMeta(data, "");
         routeEl.textContent = providerRouteLabel(data);
       } else {
         clockEl.textContent = "-";
-        timeEl.textContent = formatOcrMeta(data, monitorClock);
+        timeEl.textContent = formatOcrMeta(data, "");
         routeEl.textContent = providerRouteLabel(data);
       }
       row.append(labelEl, clockEl, timeEl, routeEl);
@@ -494,7 +488,7 @@ function renderSnapshots(items) {
   root.innerHTML = "";
   const groups = [
     { title: "缓存截图", videoKind: "cache_video", audioKind: "cache_audio" },
-    { title: "验证截图", videoKind: "video", audioKind: "audio" },
+    { title: "预览截图", videoKind: "video", audioKind: "audio" },
   ];
   for (const group of groups) {
     const panel = document.createElement("div");
